@@ -3,6 +3,15 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
+import { after } from "node:test";
+
+import {
+  clearBrokerSession,
+  loadBrokerSession,
+  sendBrokerShutdown,
+  teardownBrokerSession
+} from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
+import { terminateProcessTree } from "../plugins/codex/scripts/lib/process.mjs";
 
 // Tests may run inside a Claude Code session with this plugin installed; keep its codex_home and
 // auto_review overrides out of the child processes so each test controls them itself.
@@ -11,9 +20,27 @@ delete process.env.CODEX_COMPANION_CODEX_HOME;
 delete process.env.CLAUDE_PLUGIN_OPTION_AUTO_REVIEW;
 delete process.env.CODEX_COMPANION_AUTO_REVIEW;
 
+const tempDirs = [];
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  tempDirs.push(dir);
+  return dir;
 }
+
+// Companion commands lazily start a detached shared broker per workspace, and only the SessionEnd hook
+// stops it. Shut down any broker a test left behind the same way, so test runs don't leak processes.
+after(async () => {
+  for (const dir of tempDirs) {
+    const session = loadBrokerSession(dir);
+    if (!session) {
+      continue;
+    }
+    await sendBrokerShutdown(session.endpoint);
+    teardownBrokerSession({ ...session, killProcess: terminateProcessTree });
+    clearBrokerSession(dir);
+  }
+});
 
 export function writeExecutable(filePath, source) {
   fs.writeFileSync(filePath, source, { encoding: "utf8", mode: 0o755 });
