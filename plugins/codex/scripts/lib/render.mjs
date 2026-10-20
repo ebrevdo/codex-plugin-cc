@@ -185,6 +185,7 @@ export function renderSetupReport(report) {
     `- npm: ${report.npm.detail}`,
     `- codex: ${report.codex.detail}`,
     `- codex home: ${report.codexHome.path} (${report.codexHome.source})`,
+    `- task approvals: ${report.taskApprovals.mode} (${report.taskApprovals.source})`,
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
     `- review gate: ${report.reviewGateEnabled ? "enabled" : "disabled"}`,
@@ -461,6 +462,32 @@ export function renderCancelReport(job) {
     lines.push(`- Summary: ${job.summary}`);
   }
   lines.push("- Check `/codex:status` for the updated queue.");
+
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderSteerReport(job, steer) {
+  const lines = [
+    "# Codex Steer",
+    "",
+    steer.steered ? `Steered ${job.id}.` : `Could not steer ${job.id}: ${steer.detail}`,
+    ""
+  ];
+
+  if (job.title) {
+    lines.push(`- Title: ${job.title}`);
+  }
+  if (job.summary) {
+    lines.push(`- Summary: ${job.summary}`);
+  }
+  if (steer.steered) {
+    lines.push("- Codex picks up the instructions mid-turn. Check `/codex:status` to follow along.");
+  } else if (steer.attempted) {
+    lines.push("- If the turn already finished, send the instructions with `/codex:rescue --resume` instead.");
+    lines.push(
+      "- A job that started while another Codex job held the shared runtime runs on its own app server and cannot be steered; use `/codex:cancel` and `/codex:rescue --resume`."
+    );
+  }
 
   return `${lines.join("\n").trimEnd()}\n`;
 }

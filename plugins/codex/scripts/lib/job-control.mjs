@@ -278,10 +278,25 @@ export function resolveResultJob(cwd, reference) {
   throw new Error("No finished Codex jobs found for this repository yet.");
 }
 
-export function resolveCancelableJob(cwd, reference, options = {}) {
+function listActiveJobs(workspaceRoot) {
+  return sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.status === "queued" || job.status === "running");
+}
+
+// Like resolveActiveJob with a reference, but returns null instead of throwing when nothing matches.
+export function findActiveJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
+  try {
+    const job = matchJobReference(listActiveJobs(workspaceRoot), reference);
+    return job ? { workspaceRoot, job } : null;
+  } catch {
+    return null;
+  }
+}
+
+export function resolveActiveJob(cwd, reference, options = {}) {
+  const { command } = options;
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const activeJobs = listActiveJobs(workspaceRoot);
 
   if (reference) {
     const selected = matchJobReference(activeJobs, reference);
@@ -297,12 +312,12 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
     return { workspaceRoot, job: sessionScopedActiveJobs[0] };
   }
   if (sessionScopedActiveJobs.length > 1) {
-    throw new Error("Multiple Codex jobs are active. Pass a job id to /codex:cancel.");
+    throw new Error(`Multiple Codex jobs are active. Pass a job id to /codex:${command}.`);
   }
 
   if (getCurrentSessionId(options)) {
-    throw new Error("No active Codex jobs to cancel for this session.");
+    throw new Error(`No active Codex jobs to ${command} for this session.`);
   }
 
-  throw new Error("No active Codex jobs to cancel.");
+  throw new Error(`No active Codex jobs to ${command}.`);
 }

@@ -6,6 +6,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { AUTO_REVIEW_OPTION_ENV } from "./lib/auto-review.mjs";
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
@@ -100,6 +101,8 @@ function runStopReview(cwd, input = {}) {
   const prompt = buildStopReviewPrompt(input);
   const childEnv = {
     ...process.env,
+    // The stop-time review stays a non-escalating review even when auto-review is on for tasks.
+    [AUTO_REVIEW_OPTION_ENV]: "false",
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
   const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {

@@ -15,6 +15,7 @@ import {
 } from "./lib/broker-lifecycle.mjs";
 import { loadState, resolveStateFile, saveState } from "./lib/state.mjs";
 import { TRANSCRIPT_PATH_ENV } from "./lib/claude-session-transfer.mjs";
+import { AUTO_REVIEW_OPTION_ENV, AUTO_REVIEW_OVERRIDE_ENV } from "./lib/auto-review.mjs";
 import { CODEX_HOME_OPTION_ENV, CODEX_HOME_OVERRIDE_ENV, expandHomePath } from "./lib/codex-home.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
@@ -80,6 +81,7 @@ function handleSessionStart(input) {
   appendEnvVar(TRANSCRIPT_PATH_ENV, input.transcript_path);
   appendEnvVar(PLUGIN_DATA_ENV, process.env[PLUGIN_DATA_ENV]);
   appendEnvVar(CODEX_HOME_OVERRIDE_ENV, expandHomePath(process.env[CODEX_HOME_OPTION_ENV]));
+  appendEnvVar(AUTO_REVIEW_OVERRIDE_ENV, process.env[AUTO_REVIEW_OPTION_ENV]);
 }
 
 async function handleSessionEnd(input) {

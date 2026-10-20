@@ -11,7 +11,7 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, `/codex:steer`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
 
 ## Requirements
 
@@ -217,6 +217,25 @@ Examples:
 /codex:cancel task-abc123
 ```
 
+### `/codex:steer`
+
+Sends new instructions to a running background Codex job without stopping it. Codex folds them into the turn it is already working on.
+
+If you leave out the job id, it steers the only active job from this session.
+
+Examples:
+
+```bash
+/codex:steer focus on the parser, not the tokenizer
+/codex:steer task-abc123 skip the integration tests for now
+```
+
+**Notes:**
+
+- once the turn has finished, use `/codex:rescue --resume` instead
+- a job that started while another Codex job was running gets its own app server and cannot be steered
+- native `/codex:review` turns cannot be steered
+
 ### `/codex:setup`
 
 Checks whether Codex is installed and authenticated.
@@ -261,6 +280,7 @@ Then check in with:
 
 ```bash
 /codex:status
+/codex:steer change of plan: only touch the retry logic
 /codex:result
 ```
 
@@ -284,6 +304,12 @@ Your configuration will be picked up based on:
 - project-level overrides only load when the [project is trusted](https://developers.openai.com/codex/config-advanced#project-config-files-codexconfigtoml)
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
+
+### Auto-Review Approvals
+
+By default the plugin runs every Codex thread with `approval_policy = "never"`, whatever your `config.toml` says, so Codex never stops to ask and stays inside its sandbox.
+
+Turn on the plugin's `auto_review` option to let `/codex:rescue` tasks ask for escalations such as writes outside the sandbox or network access. Codex's auto-review subagent approves or denies each request (`approval_policy = "on-request"` with `approvals_reviewer = "auto_review"`). `/codex:review`, `/codex:adversarial-review`, and the stop-time review gate are unaffected. `/codex:setup` shows the current setting.
 
 ### Moving The Work Over To Codex
 
@@ -311,7 +337,7 @@ That means:
 
 ### Will it use the same Codex config I already have?
 
-Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations).
+Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations). The exception is approvals, which the plugin sets itself (see [Auto-Review Approvals](#auto-review-approvals)).
 
 ### Can I keep using my current API key or base URL setup?
 

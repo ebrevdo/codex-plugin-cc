@@ -10,6 +10,8 @@ import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
+// Requests another client may send while a turn streams to its owner: stopping or steering that turn.
+const TURN_CONTROL_METHODS = new Set(["turn/interrupt", "turn/steer"]);
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -33,8 +35,8 @@ function send(socket, message) {
   socket.write(`${JSON.stringify(message)}\n`);
 }
 
-function isInterruptRequest(message) {
-  return message?.method === "turn/interrupt";
+function isTurnControlRequest(message) {
+  return TURN_CONTROL_METHODS.has(message?.method);
 }
 
 function writePidFile(pidFile) {
@@ -167,12 +169,12 @@ async function main() {
           continue;
         }
 
-        const allowInterruptDuringActiveStream =
-          isInterruptRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
+        const allowTurnControlDuringActiveStream =
+          isTurnControlRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
 
         if (
           ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
-          !allowInterruptDuringActiveStream
+          !allowTurnControlDuringActiveStream
         ) {
           send(socket, {
             id: message.id,
@@ -181,7 +183,7 @@ async function main() {
           continue;
         }
 
-        if (allowInterruptDuringActiveStream) {
+        if (allowTurnControlDuringActiveStream) {
           try {
             const result = await appClient.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });

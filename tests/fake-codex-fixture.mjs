@@ -144,6 +144,21 @@ function ensureThread(state, threadId) {
   return thread;
 }
 
+function inputText(input) {
+  return (input || [])
+    .filter((item) => item.type === "text")
+    .map((item) => item.text)
+    .join("\\n");
+}
+
+function threadApprovalParams(params) {
+  return {
+    approvalPolicy: params.approvalPolicy ?? null,
+    approvalsReviewer: params.approvalsReviewer ?? null,
+    sandbox: params.sandbox ?? null
+  };
+}
+
 function nextTurnId(state) {
   const turnId = "turn_" + state.nextTurnId++;
   saveState(state);
@@ -317,6 +332,7 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
+        state.lastThreadStart = threadApprovalParams(message.params);
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
@@ -351,6 +367,7 @@ rl.on("line", (line) => {
         }
         const thread = ensureThread(state, message.params.threadId);
         thread.updatedAt = now();
+        state.lastThreadResume = threadApprovalParams(message.params);
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         break;
@@ -443,10 +460,7 @@ rl.on("line", (line) => {
 
 	      case "turn/start": {
 	        const thread = ensureThread(state, message.params.threadId);
-	        const prompt = (message.params.input || [])
-          .filter((item) => item.type === "text")
-          .map((item) => item.text)
-          .join("\\n");
+	        const prompt = inputText(message.params.input);
         const turnId = nextTurnId(state);
         thread.updatedAt = now();
 	        state.lastTurnStart = {
@@ -632,6 +646,21 @@ rl.on("line", (line) => {
 	          });
 	        }
 	        send({ id: message.id, result: {} });
+	        break;
+	      }
+
+	      case "turn/steer": {
+	        state.lastSteer = {
+	          threadId: message.params.threadId,
+	          expectedTurnId: message.params.expectedTurnId,
+	          prompt: inputText(message.params.input)
+	        };
+	        saveState(state);
+	        if (!interruptibleTurns.has(message.params.expectedTurnId)) {
+	          send({ id: message.id, error: { code: -32600, message: "no active turn to steer" } });
+	          break;
+	        }
+	        send({ id: message.id, result: { turnId: message.params.expectedTurnId } });
 	        break;
 	      }
 

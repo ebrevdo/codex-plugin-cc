@@ -65,6 +65,7 @@ function buildThreadParams(cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
+    approvalsReviewer: options.approvalsReviewer ?? null,
     sandbox: options.sandbox ?? "read-only",
     serviceName: SERVICE_NAME,
     ephemeral: options.ephemeral ?? true
@@ -78,6 +79,7 @@ function buildResumeParams(threadId, cwd, options = {}) {
     cwd,
     model: options.model ?? null,
     approvalPolicy: options.approvalPolicy ?? "never",
+    approvalsReviewer: options.approvalsReviewer ?? null,
     sandbox: options.sandbox ?? "read-only"
   };
 }
@@ -953,46 +955,54 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
-  if (!threadId || !turnId) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: "missing threadId or turnId"
-    };
-  }
-
+// Sends a request that acts on an in-flight turn, through the shared runtime that is running it.
+async function requestActiveTurn(cwd, method, params, successDetail) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {
-    return {
-      attempted: false,
-      interrupted: false,
-      transport: null,
-      detail: availability.detail
-    };
+    return { attempted: false, ok: false, transport: null, detail: availability.detail };
   }
 
   let client = null;
   try {
     client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
-    await client.request("turn/interrupt", { threadId, turnId });
-    return {
-      attempted: true,
-      interrupted: true,
-      transport: client.transport,
-      detail: `Interrupted ${turnId} on ${threadId}.`
-    };
+    await client.request(method, params);
+    return { attempted: true, ok: true, transport: client.transport, detail: successDetail };
   } catch (error) {
     return {
       attempted: true,
-      interrupted: false,
+      ok: false,
       transport: client?.transport ?? null,
       detail: error instanceof Error ? error.message : String(error)
     };
   } finally {
     await client?.close().catch(() => {});
   }
+}
+
+export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
+  if (!threadId || !turnId) {
+    return { attempted: false, interrupted: false, transport: null, detail: "missing threadId or turnId" };
+  }
+  const { ok, ...result } = await requestActiveTurn(
+    cwd,
+    "turn/interrupt",
+    { threadId, turnId },
+    `Interrupted ${turnId} on ${threadId}.`
+  );
+  return { ...result, interrupted: ok };
+}
+
+export async function steerAppServerTurn(cwd, { threadId, turnId, prompt }) {
+  if (!threadId || !turnId) {
+    return { attempted: false, steered: false, transport: null, detail: "the job has not started a Codex turn yet" };
+  }
+  const { ok, ...result } = await requestActiveTurn(
+    cwd,
+    "turn/steer",
+    { threadId, expectedTurnId: turnId, input: buildTurnInput(prompt) },
+    `Steered ${turnId} on ${threadId}.`
+  );
+  return { ...result, steered: ok };
 }
 
 export async function runAppServerReview(cwd, options = {}) {
@@ -1097,19 +1107,24 @@ export async function runAppServerTurn(cwd, options = {}) {
   return withAppServer(cwd, async (client) => {
     let threadId;
 
+    const threadOptions = {
+      model: options.model,
+      sandbox: options.sandbox,
+      approvalPolicy: options.approvalPolicy,
+      approvalsReviewer: options.approvalsReviewer
+    };
+
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
       const response = await resumeThread(client, options.resumeThreadId, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
+        ...threadOptions,
         ephemeral: false
       });
       threadId = response.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");
       const response = await startThread(client, cwd, {
-        model: options.model,
-        sandbox: options.sandbox,
+        ...threadOptions,
         ephemeral: options.persistThread ? false : true,
         threadName: options.persistThread ? options.threadName : options.threadName ?? null
       });

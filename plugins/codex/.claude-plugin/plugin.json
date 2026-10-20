@@ -11,6 +11,12 @@
       "title": "Codex home",
       "description": "CODEX_HOME directory for every Codex process this plugin starts (auth, config, sessions). Overrides CODEX_HOME from your shell. ~ and $HOME are expanded.",
       "default": "~/.codex"
+    },
+    "auto_review": {
+      "type": "boolean",
+      "title": "Auto-review approvals",
+      "description": "Let Codex ask for approval during /codex:rescue tasks (sandbox escapes, network access) and have its auto-review subagent approve or deny each request. When off, tasks never ask and stay inside their sandbox. Reviews and the stop-time review gate are unaffected.",
+      "default": false
     }
   }
 }

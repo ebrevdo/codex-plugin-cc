@@ -42,6 +42,7 @@ test("setup reports ready when fake codex is installed and authenticated", () =>
   assert.equal(payload.ready, true);
   assert.match(payload.codex.detail, /advanced runtime available/);
   assert.equal(payload.sessionRuntime.mode, "direct");
+  assert.deepEqual(payload.taskApprovals, { mode: "never", source: "default" });
 });
 
 test("setup is ready without npm when Codex is already installed and authenticated", () => {
@@ -103,6 +104,18 @@ test("setup leaves the shell's CODEX_HOME alone when the plugin option is unset"
   const payload = JSON.parse(result.stdout);
   assert.deepEqual(payload.codexHome, { path: codexHome, source: "CODEX_HOME" });
   assert.equal(payload.auth.detail, `ChatGPT login active for ${codexHome}`);
+});
+
+test("setup reports auto-review task approvals when the option is on", () => {
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+
+  const enabled = run("node", [SCRIPT, "setup"], {
+    cwd: ROOT,
+    env: { ...buildEnv(binDir), CODEX_COMPANION_AUTO_REVIEW: "true" }
+  });
+  assert.equal(enabled.status, 0, enabled.stderr);
+  assert.match(enabled.stdout, /^- task approvals: auto-review \(plugin config\)$/m);
 });
 
 test("setup trusts app-server API key auth even when login status alone would fail", () => {
@@ -738,7 +751,7 @@ test("session start hook exports the Claude session id, transcript path, and plu
   );
 });
 
-test("session start hook persists the expanded codex_home option for later Bash commands", () => {
+test("session start hook persists the codex_home and auto_review options for later Bash commands", () => {
   const repo = makeTempDir();
   const home = makeTempDir();
   const envFile = path.join(makeTempDir(), "claude-env.sh");
@@ -750,7 +763,8 @@ test("session start hook persists the expanded codex_home option for later Bash 
       ...process.env,
       HOME: home,
       CLAUDE_ENV_FILE: envFile,
-      CLAUDE_PLUGIN_OPTION_CODEX_HOME: "$HOME/.codex"
+      CLAUDE_PLUGIN_OPTION_CODEX_HOME: "$HOME/.codex",
+      CLAUDE_PLUGIN_OPTION_AUTO_REVIEW: "true"
     },
     input: JSON.stringify({ hook_event_name: "SessionStart", session_id: "sess-current", cwd: repo })
   });
@@ -760,6 +774,7 @@ test("session start hook persists the expanded codex_home option for later Bash 
     fs.readFileSync(envFile, "utf8"),
     new RegExp(`^export CODEX_COMPANION_CODEX_HOME='${path.join(home, ".codex").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'$`, "m")
   );
+  assert.match(fs.readFileSync(envFile, "utf8"), /^export CODEX_COMPANION_AUTO_REVIEW='true'$/m);
 });
 
 test("write task output focuses on the Codex result without generic follow-up hints", () => {
@@ -846,6 +861,36 @@ test("task forwards model selection and reasoning effort to app-server turn/star
   const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
   assert.equal(fakeState.lastTurnStart.model, "gpt-5.3-codex-spark");
   assert.equal(fakeState.lastTurnStart.effort, "low");
+  assert.deepEqual(fakeState.lastThreadStart, { approvalPolicy: "never", approvalsReviewer: null, sandbox: "read-only" });
+});
+
+test("task threads route approvals to auto-review when the option is enabled, including on resume", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_AUTO_REVIEW: "true" };
+
+  const firstRun = run("node", [SCRIPT, "task", "--write", "fix the failing test"], { cwd: repo, env });
+  assert.equal(firstRun.status, 0, firstRun.stderr);
+  const resumed = run("node", [SCRIPT, "task", "--resume", "also update the docs"], { cwd: repo, env });
+  assert.equal(resumed.status, 0, resumed.stderr);
+
+  const fakeState = JSON.parse(fs.readFileSync(statePath, "utf8"));
+  assert.deepEqual(fakeState.lastThreadStart, {
+    approvalPolicy: "on-request",
+    approvalsReviewer: "auto_review",
+    sandbox: "workspace-write"
+  });
+  assert.deepEqual(fakeState.lastThreadResume, {
+    approvalPolicy: "on-request",
+    approvalsReviewer: "auto_review",
+    sandbox: "read-only"
+  });
 });
 
 test("task logs reasoning summaries and assistant messages to the job log", () => {
@@ -1801,10 +1846,9 @@ test("cancel with a job id can still target an active job from another Claude se
   assert.equal(state.jobs[0].status, "cancelled");
 });
 
-test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
+async function launchRunningBackgroundTask() {
   const repo = makeTempDir();
   const binDir = makeTempDir();
-  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir, "interruptible-slow-task");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -1816,21 +1860,31 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     cwd: repo,
     env
   });
-
   assert.equal(launched.status, 0, launched.stderr);
-  const launchPayload = JSON.parse(launched.stdout);
-  const jobId = launchPayload.jobId;
+  const jobId = JSON.parse(launched.stdout).jobId;
   assert.ok(jobId);
 
   const stateDir = resolveStateDir(repo);
   const runningJob = await waitFor(() => {
     const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
     const job = state.jobs.find((candidate) => candidate.id === jobId);
-    if (job?.status === "running" && job.threadId && job.turnId) {
-      return job;
-    }
-    return null;
+    return job?.status === "running" && job.threadId && job.turnId ? job : null;
   }, { timeoutMs: 15000 });
+
+  return { repo, env, jobId, runningJob, stateDir, fakeStatePath: path.join(binDir, "fake-codex-state.json") };
+}
+
+function endSession(repo, env) {
+  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+  assert.equal(cleanup.status, 0, cleanup.stderr);
+}
+
+test("cancel sends turn interrupt to the shared app-server before killing a brokered task", async () => {
+  const { repo, env, jobId, runningJob, fakeStatePath } = await launchRunningBackgroundTask();
 
   const cancelResult = run("node", [SCRIPT, "cancel", jobId, "--json"], {
     cwd: repo,
@@ -1854,15 +1908,73 @@ test("cancel sends turn interrupt to the shared app-server before killing a brok
     turnId: runningJob.turnId
   });
 
-  const cleanup = run("node", [SESSION_HOOK, "SessionEnd"], {
+  endSession(repo, env);
+});
+
+test("steer sends turn/steer for the running turn through the shared app-server", async () => {
+  const { repo, env, jobId, runningJob, fakeStatePath } = await launchRunningBackgroundTask();
+
+  const steerResult = run("node", [SCRIPT, "steer", jobId, "--json", "focus", "on", "the", "retry", "loop"], {
     cwd: repo,
-    env,
-    input: JSON.stringify({
-      hook_event_name: "SessionEnd",
-      cwd: repo
-    })
+    env
   });
-  assert.equal(cleanup.status, 0, cleanup.stderr);
+
+  assert.equal(steerResult.status, 0, steerResult.stderr);
+  const payload = JSON.parse(steerResult.stdout);
+  assert.equal(payload.jobId, jobId);
+  assert.equal(payload.steered, true);
+
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.deepEqual(fakeState.lastSteer, {
+    threadId: runningJob.threadId,
+    expectedTurnId: runningJob.turnId,
+    prompt: "focus on the retry loop"
+  });
+  assert.match(fs.readFileSync(runningJob.logFile, "utf8"), /Steered turn turn_\d+: focus on the retry loop/);
+
+  endSession(repo, env);
+});
+
+test("steer without a job id targets the only active job and keeps every word of the instructions", async () => {
+  const { repo, env, runningJob, fakeStatePath } = await launchRunningBackgroundTask();
+
+  const steerResult = run("node", [SCRIPT, "steer", "task", "scope", "changed:", "only", "the", "parser"], {
+    cwd: repo,
+    env
+  });
+
+  assert.equal(steerResult.status, 0, steerResult.stderr);
+  assert.match(steerResult.stdout, /^Steered task-/m);
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.lastSteer.expectedTurnId, runningJob.turnId);
+  assert.equal(fakeState.lastSteer.prompt, "task scope changed: only the parser");
+
+  endSession(repo, env);
+});
+
+test("steer reports a failure when Codex rejects the steer", async () => {
+  const { env, repo, jobId, runningJob, stateDir } = await launchRunningBackgroundTask();
+  const jobFile = path.join(stateDir, "jobs", `${jobId}.json`);
+  const stored = JSON.parse(fs.readFileSync(jobFile, "utf8"));
+  fs.writeFileSync(jobFile, JSON.stringify({ ...stored, turnId: "turn_stale" }), "utf8");
+
+  const steerResult = run("node", [SCRIPT, "steer", jobId, "--json", "focus on the retry loop"], { cwd: repo, env });
+
+  assert.equal(steerResult.status, 1);
+  const payload = JSON.parse(steerResult.stdout);
+  assert.equal(payload.steerAttempted, true);
+  assert.equal(payload.steered, false);
+  assert.match(payload.detail, /no active turn to steer/);
+  assert.match(fs.readFileSync(runningJob.logFile, "utf8"), /Codex turn steer failed: no active turn to steer/);
+
+  endSession(repo, env);
+});
+
+test("steer requires instructions", () => {
+  const repo = makeTempDir();
+  const result = run("node", [SCRIPT, "steer"], { cwd: repo, env: process.env });
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Provide steering instructions/);
 });
 
 test("session end fully cleans up jobs for the ending session", async (t) => {
@@ -2103,6 +2215,7 @@ test("stop hook logs running tasks to stderr without blocking when the review ga
 test("stop hook allows the stop when the review gate is enabled and the stop-time review task is clean", () => {
   const repo = makeTempDir();
   const binDir = makeTempDir();
+  const statePath = path.join(binDir, "fake-codex-state.json");
   installFakeCodex(binDir, "adversarial-clean");
   initGitRepo(repo);
   fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
@@ -2117,12 +2230,14 @@ test("stop hook allows the stop when the review gate is enabled and the stop-tim
 
   const allowed = run("node", [STOP_HOOK], {
     cwd: repo,
-    env: buildEnv(binDir),
+    env: { ...buildEnv(binDir), CLAUDE_PLUGIN_OPTION_AUTO_REVIEW: "true" },
     input: JSON.stringify({ cwd: repo, session_id: "sess-stop-clean" })
   });
 
   assert.equal(allowed.status, 0, allowed.stderr);
   assert.equal(allowed.stdout.trim(), "");
+  // The stop-time review never escalates, even with auto-review on for tasks.
+  assert.equal(JSON.parse(fs.readFileSync(statePath, "utf8")).lastThreadStart.approvalPolicy, "never");
 });
 
 test("stop hook does not block when Codex is unavailable even if the review gate is enabled", () => {

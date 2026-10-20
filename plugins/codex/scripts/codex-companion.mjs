@@ -19,8 +19,10 @@ import {
     parseStructuredOutput,
     readOutputSchema,
     runAppServerReview,
-    runAppServerTurn
+    runAppServerTurn,
+    steerAppServerTurn
   } from "./lib/codex.mjs";
+import { describeTaskApprovals, resolveTaskApprovals } from "./lib/auto-review.mjs";
 import { applyConfiguredCodexHome, describeCodexHome } from "./lib/codex-home.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
@@ -38,8 +40,9 @@ import {
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  findActiveJob,
   readStoredJob,
-  resolveCancelableJob,
+  resolveActiveJob,
   resolveResultJob,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
@@ -62,6 +65,7 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
+  renderSteerReport,
   renderTaskResult
 } from "./lib/render.mjs";
 
@@ -84,7 +88,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
-      "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
+      "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
+      "  node scripts/codex-companion.mjs steer [job-id] [--prompt-file <path>] [--json] [instructions]"
     ].join("\n")
   );
 }
@@ -206,6 +211,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     npm: npmStatus,
     codex: codexStatus,
     codexHome: describeCodexHome(),
+    taskApprovals: describeTaskApprovals(),
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
@@ -491,6 +497,7 @@ async function executeTaskRun(request) {
     model: request.model,
     effort: request.effort,
     sandbox: request.write ? "workspace-write" : "read-only",
+    ...resolveTaskApprovals(),
     onProgress: request.onProgress,
     persistThread: true,
     threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
@@ -962,6 +969,15 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+function resolveJobTurn(workspaceRoot, job) {
+  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
+  return {
+    existing,
+    threadId: existing.threadId ?? job.threadId ?? null,
+    turnId: existing.turnId ?? job.turnId ?? null
+  };
+}
+
 async function handleCancel(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd"],
@@ -970,10 +986,8 @@ async function handleCancel(argv) {
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
-  const { workspaceRoot, job } = resolveCancelableJob(cwd, reference, { env: process.env });
-  const existing = readStoredJob(workspaceRoot, job.id) ?? {};
-  const threadId = existing.threadId ?? job.threadId ?? null;
-  const turnId = existing.turnId ?? job.turnId ?? null;
+  const { workspaceRoot, job } = resolveActiveJob(cwd, reference, { env: process.env, command: "cancel" });
+  const { existing, threadId, turnId } = resolveJobTurn(workspaceRoot, job);
 
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
@@ -1023,6 +1037,50 @@ async function handleCancel(argv) {
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
 }
 
+async function handleSteer(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "prompt-file"],
+    booleanOptions: ["json"]
+  });
+
+  const cwd = resolveCommandCwd(options);
+  // A leading token names the job only when it matches an active job id, so instructions can start with any word.
+  const [first, ...rest] = positionals;
+  const named = first?.includes("-") ? findActiveJob(cwd, first) : null;
+  const prompt = (readTaskPrompt(cwd, options, named ? rest : positionals) ?? "").trim();
+  if (!prompt) {
+    throw new Error("Provide steering instructions, a prompt file, or piped stdin.");
+  }
+
+  const { workspaceRoot, job } = named ?? resolveActiveJob(cwd, "", { env: process.env, command: "steer" });
+  const { threadId, turnId } = resolveJobTurn(workspaceRoot, job);
+
+  const steer = await steerAppServerTurn(cwd, { threadId, turnId, prompt });
+  if (steer.attempted) {
+    appendLogLine(
+      job.logFile,
+      steer.steered
+        ? `Steered turn ${turnId}: ${shorten(prompt)}`
+        : `Codex turn steer failed${steer.detail ? `: ${steer.detail}` : "."}`
+    );
+  }
+
+  const payload = {
+    jobId: job.id,
+    title: job.title,
+    threadId,
+    turnId,
+    steerAttempted: steer.attempted,
+    steered: steer.steered,
+    detail: steer.detail
+  };
+
+  outputCommandResult(payload, renderSteerReport(job, steer), options.json);
+  if (!steer.steered) {
+    process.exitCode = 1;
+  }
+}
+
 async function main() {
   applyConfiguredCodexHome();
   const [subcommand, ...argv] = process.argv.slice(2);
@@ -1063,6 +1121,9 @@ async function main() {
       break;
     case "cancel":
       await handleCancel(argv);
+      break;
+    case "steer":
+      await handleSteer(argv);
       break;
     default:
       throw new Error(`Unknown subcommand: ${subcommand}`);
