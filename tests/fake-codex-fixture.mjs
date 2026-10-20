@@ -75,6 +75,11 @@ function buildAccountReadResult() {
       return { account: null, requiresOpenaiAuth: false };
     case "api-key-account-only":
       return { account: { type: "apiKey" }, requiresOpenaiAuth: true };
+    case "echo-codex-home":
+      return {
+        account: { type: "chatgpt", email: process.env.CODEX_HOME || "unset", planType: "plus" },
+        requiresOpenaiAuth: true
+      };
     default:
       return {
         account: { type: "chatgpt", email: "test@example.com", planType: "plus" },

@@ -4,5 +4,13 @@
   "description": "Use Codex from Claude Code to review code or delegate tasks.",
   "author": {
     "name": "OpenAI"
+  },
+  "userConfig": {
+    "codex_home": {
+      "type": "directory",
+      "title": "Codex home",
+      "description": "CODEX_HOME directory for every Codex process this plugin starts (auth, config, sessions). Overrides CODEX_HOME from your shell. ~ and $HOME are expanded.",
+      "default": "~/.codex"
+    }
   }
 }

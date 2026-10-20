@@ -65,6 +65,46 @@ test("setup is ready without npm when Codex is already installed and authenticat
   assert.equal(payload.auth.loggedIn, true);
 });
 
+test("setup launches Codex with the plugin-configured CODEX_HOME instead of the shell's", () => {
+  const binDir = makeTempDir();
+  const home = makeTempDir();
+  installFakeCodex(binDir, "echo-codex-home");
+
+  for (const optionEnv of ["CLAUDE_PLUGIN_OPTION_CODEX_HOME", "CODEX_COMPANION_CODEX_HOME"]) {
+    const result = run("node", [SCRIPT, "setup", "--json"], {
+      cwd: ROOT,
+      env: {
+        ...buildEnv(binDir),
+        HOME: home,
+        CODEX_HOME: path.join(home, ".shell-codex"),
+        [optionEnv]: "~/.plugin-codex"
+      }
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+    const payload = JSON.parse(result.stdout);
+    const expected = path.join(home, ".plugin-codex");
+    assert.deepEqual(payload.codexHome, { path: expected, source: "plugin config" });
+    assert.equal(payload.auth.detail, `ChatGPT login active for ${expected}`);
+  }
+});
+
+test("setup leaves the shell's CODEX_HOME alone when the plugin option is unset", () => {
+  const binDir = makeTempDir();
+  const codexHome = path.join(makeTempDir(), ".shell-codex");
+  installFakeCodex(binDir, "echo-codex-home");
+
+  const result = run("node", [SCRIPT, "setup", "--json"], {
+    cwd: ROOT,
+    env: { ...buildEnv(binDir), CODEX_HOME: codexHome }
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  const payload = JSON.parse(result.stdout);
+  assert.deepEqual(payload.codexHome, { path: codexHome, source: "CODEX_HOME" });
+  assert.equal(payload.auth.detail, `ChatGPT login active for ${codexHome}`);
+});
+
 test("setup trusts app-server API key auth even when login status alone would fail", () => {
   const binDir = makeTempDir();
   installFakeCodex(binDir, "api-key-account-only");
@@ -695,6 +735,30 @@ test("session start hook exports the Claude session id, transcript path, and plu
   assert.equal(
     fs.readFileSync(envFile, "utf8"),
     `export CODEX_COMPANION_SESSION_ID='sess-current'\nexport CODEX_COMPANION_TRANSCRIPT_PATH='${transcriptPath}'\nexport CLAUDE_PLUGIN_DATA='${pluginDataDir}'\n`
+  );
+});
+
+test("session start hook persists the expanded codex_home option for later Bash commands", () => {
+  const repo = makeTempDir();
+  const home = makeTempDir();
+  const envFile = path.join(makeTempDir(), "claude-env.sh");
+  fs.writeFileSync(envFile, "", "utf8");
+
+  const result = run("node", [SESSION_HOOK, "SessionStart"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      HOME: home,
+      CLAUDE_ENV_FILE: envFile,
+      CLAUDE_PLUGIN_OPTION_CODEX_HOME: "$HOME/.codex"
+    },
+    input: JSON.stringify({ hook_event_name: "SessionStart", session_id: "sess-current", cwd: repo })
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(
+    fs.readFileSync(envFile, "utf8"),
+    new RegExp(`^export CODEX_COMPANION_CODEX_HOME='${path.join(home, ".codex").replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}'$`, "m")
   );
 });
 

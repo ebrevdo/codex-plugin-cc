@@ -21,6 +21,7 @@ import {
     runAppServerReview,
     runAppServerTurn
   } from "./lib/codex.mjs";
+import { applyConfiguredCodexHome, describeCodexHome } from "./lib/codex-home.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
@@ -204,6 +205,7 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     node: nodeStatus,
     npm: npmStatus,
     codex: codexStatus,
+    codexHome: describeCodexHome(),
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
     reviewGateEnabled: Boolean(config.stopReviewGate),
@@ -1022,6 +1024,7 @@ async function handleCancel(argv) {
 }
 
 async function main() {
+  applyConfiguredCodexHome();
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {
     printUsage();

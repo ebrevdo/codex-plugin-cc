@@ -4,6 +4,11 @@ import path from "node:path";
 import process from "node:process";
 import { spawnSync } from "node:child_process";
 
+// Tests may run inside a Claude Code session with this plugin installed; keep its codex_home override
+// out of the child processes so each test controls CODEX_HOME itself.
+delete process.env.CLAUDE_PLUGIN_OPTION_CODEX_HOME;
+delete process.env.CODEX_COMPANION_CODEX_HOME;
+
 export function makeTempDir(prefix = "codex-plugin-test-") {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
