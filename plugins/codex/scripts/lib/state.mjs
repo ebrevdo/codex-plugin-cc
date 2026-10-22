@@ -9,11 +9,78 @@ const STATE_VERSION = 1;
 const PLUGIN_DATA_ENV = "CLAUDE_PLUGIN_DATA";
 const FALLBACK_STATE_ROOT_DIR = path.join(os.tmpdir(), "codex-companion");
 const STATE_FILE_NAME = "state.json";
+const STATE_LOCK_FILE_NAME = "state.lock";
 const JOBS_DIR_NAME = "jobs";
 const MAX_JOBS = 50;
+const STATE_LOCK_WAIT_MS = 5000;
+const STATE_LOCK_STALE_MS = 10000;
+const sleepCell = new Int32Array(new SharedArrayBuffer(4));
 
 function nowIso() {
   return new Date().toISOString();
+}
+
+// Replaces the file in one step, so a concurrent reader sees the old or the new contents, never a torn write.
+function writeFileAtomic(filePath, contents) {
+  const tempPath = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tempPath, contents, "utf8");
+    fs.renameSync(tempPath, filePath);
+  } catch {
+    fs.rmSync(tempPath, { force: true });
+    fs.writeFileSync(filePath, contents, "utf8");
+  }
+}
+
+function isLockStale(lockPath) {
+  try {
+    const holder = Number.parseInt(fs.readFileSync(lockPath, "utf8"), 10);
+    if (Number.isFinite(holder) && holder > 0) {
+      try {
+        process.kill(holder, 0);
+      } catch (error) {
+        if (error?.code === "ESRCH") {
+          return true;
+        }
+      }
+    }
+    return Date.now() - fs.statSync(lockPath).mtimeMs > STATE_LOCK_STALE_MS;
+  } catch {
+    return false;
+  }
+}
+
+// Serializes read-modify-write updates of one workspace's state: several job processes and companion
+// commands update it at once, and an unserialized update can drop another one (such as a job's completion).
+// After a few seconds of waiting, proceed without the lock rather than hang the command.
+function withStateLock(cwd, fn) {
+  ensureStateDir(cwd);
+  const lockPath = path.join(resolveStateDir(cwd), STATE_LOCK_FILE_NAME);
+  const deadline = Date.now() + STATE_LOCK_WAIT_MS;
+  let locked = false;
+  while (!locked) {
+    try {
+      fs.writeFileSync(lockPath, `${process.pid}\n`, { encoding: "utf8", flag: "wx" });
+      locked = true;
+    } catch (error) {
+      if (error?.code !== "EEXIST" || Date.now() > deadline) {
+        break;
+      }
+      if (isLockStale(lockPath)) {
+        fs.rmSync(lockPath, { force: true });
+        continue;
+      }
+      Atomics.wait(sleepCell, 0, 0, 5);
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    if (locked) {
+      fs.rmSync(lockPath, { force: true });
+    }
+  }
 }
 
 function defaultState() {
@@ -26,8 +93,12 @@ function defaultState() {
   };
 }
 
-export function resolveStateDir(cwd) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
+function resolveStateRoot() {
+  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
+  return pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
+}
+
+function stateDirForWorkspaceRoot(workspaceRoot) {
   let canonicalWorkspaceRoot = workspaceRoot;
   try {
     canonicalWorkspaceRoot = fs.realpathSync.native(workspaceRoot);
@@ -38,9 +109,43 @@ export function resolveStateDir(cwd) {
   const slugSource = path.basename(workspaceRoot) || "workspace";
   const slug = slugSource.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "workspace";
   const hash = createHash("sha256").update(canonicalWorkspaceRoot).digest("hex").slice(0, 16);
-  const pluginDataDir = process.env[PLUGIN_DATA_ENV];
-  const stateRoot = pluginDataDir ? path.join(pluginDataDir, "state") : FALLBACK_STATE_ROOT_DIR;
-  return path.join(stateRoot, `${slug}-${hash}`);
+  return path.join(resolveStateRoot(), `${slug}-${hash}`);
+}
+
+export function resolveStateDir(cwd) {
+  return stateDirForWorkspaceRoot(resolveWorkspaceRoot(cwd));
+}
+
+// Every workspace with plugin state, as { workspaceRoot, stateDir, jobs }. Jobs are stored per workspace,
+// so a job started with --cwd in another repository is only visible through this listing.
+export function listWorkspaceStates() {
+  const stateRoot = resolveStateRoot();
+  let entries = [];
+  try {
+    entries = fs.readdirSync(stateRoot, { withFileTypes: true });
+  } catch {
+    return [];
+  }
+
+  const workspaces = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) {
+      continue;
+    }
+    const stateDir = path.join(stateRoot, entry.name);
+    let parsed;
+    try {
+      parsed = JSON.parse(fs.readFileSync(path.join(stateDir, STATE_FILE_NAME), "utf8"));
+    } catch {
+      continue;
+    }
+    const jobs = Array.isArray(parsed?.jobs) ? parsed.jobs : [];
+    const workspaceRoot = jobs.map((job) => job?.workspaceRoot).find((value) => typeof value === "string" && value);
+    if (workspaceRoot && stateDirForWorkspaceRoot(workspaceRoot) === stateDir) {
+      workspaces.push({ workspaceRoot, stateDir, jobs });
+    }
+  }
+  return workspaces;
 }
 
 export function resolveStateFile(cwd) {
@@ -111,14 +216,16 @@ export function saveState(cwd, state) {
     removeFileIfExists(job.logFile);
   }
 
-  fs.writeFileSync(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`, "utf8");
+  writeFileAtomic(resolveStateFile(cwd), `${JSON.stringify(nextState, null, 2)}\n`);
   return nextState;
 }
 
 export function updateState(cwd, mutate) {
-  const state = loadState(cwd);
-  mutate(state);
-  return saveState(cwd, state);
+  return withStateLock(cwd, () => {
+    const state = loadState(cwd);
+    mutate(state);
+    return saveState(cwd, state);
+  });
 }
 
 export function generateJobId(prefix = "job") {
@@ -166,7 +273,7 @@ export function getConfig(cwd) {
 export function writeJobFile(cwd, jobId, payload) {
   ensureStateDir(cwd);
   const jobFile = resolveJobFile(cwd, jobId);
-  fs.writeFileSync(jobFile, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  writeFileAtomic(jobFile, `${JSON.stringify(payload, null, 2)}\n`);
   return jobFile;
 }
 

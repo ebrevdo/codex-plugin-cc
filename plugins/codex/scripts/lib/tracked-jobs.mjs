@@ -4,6 +4,13 @@ import process from "node:process";
 import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+// Every process a job's own Codex runtime starts inherits NAME=<job id>. Cancel uses it to find the commands
+// Codex launched in their own process groups, and anything those commands left running in the background.
+export const JOB_ID_ENV = "CODEX_COMPANION_JOB_ID";
+
+export function jobProcessMarker(jobId) {
+  return `${JOB_ID_ENV}=${jobId}`;
+}
 
 export function nowIso() {
   return new Date().toISOString();
@@ -67,6 +74,20 @@ export function createJobRecord(base, options = {}) {
   };
 }
 
+// Merges `patch` into the job's stored job file and then its state entry, so anyone who sees the change in
+// the job list also finds it in the job file (as runTrackedJob does).
+export function patchJob(workspaceRoot, jobId, patch) {
+  const jobFile = resolveJobFile(workspaceRoot, jobId);
+  if (fs.existsSync(jobFile)) {
+    writeJobFile(workspaceRoot, jobId, {
+      ...readJobFile(jobFile),
+      ...patch,
+      id: jobId
+    });
+  }
+  upsertJob(workspaceRoot, { ...patch, id: jobId });
+}
+
 export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
@@ -99,18 +120,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
-
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
-    }
-
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
+    patchJob(workspaceRoot, jobId, patch);
   };
 }
 

@@ -16,11 +16,15 @@ import { parseBrokerEndpoint } from "./broker-endpoint.mjs";
 import { ensureBrokerSession, loadBrokerSession } from "./broker-lifecycle.mjs";
 import { terminateProcessTree } from "./process.mjs";
 
+export { BROKER_BUSY_RPC_CODE } from "./broker-lifecycle.mjs";
+
 const PLUGIN_MANIFEST_URL = new URL("../../.claude-plugin/plugin.json", import.meta.url);
 const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"));
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
-export const BROKER_BUSY_RPC_CODE = -32001;
+// Requests that act on a turn that is already running: stopping it or steering it. A runtime delivers them
+// at once, whoever started the turn and whatever else is in flight.
+export const TURN_CONTROL_METHODS = new Set(["turn/interrupt", "turn/steer"]);
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -75,6 +79,11 @@ class AppServerClientBase {
 
   setNotificationHandler(handler) {
     this.notificationHandler = handler;
+  }
+
+  // The app server's pid when this client spawned it; null when it talks to a broker.
+  get pid() {
+    return null;
   }
 
   /**
@@ -184,6 +193,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
   constructor(cwd, options = {}) {
     super(cwd, options);
     this.transport = "direct";
+  }
+
+  get pid() {
+    return this.proc?.pid ?? null;
   }
 
   async initialize() {

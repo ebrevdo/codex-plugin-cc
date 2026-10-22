@@ -25,9 +25,12 @@ import {
 import { describeTaskApprovals, resolveTaskApprovals } from "./lib/auto-review.mjs";
 import { applyConfiguredCodexHome, describeCodexHome } from "./lib/codex-home.mjs";
 import { resolveClaudeSessionPath } from "./lib/claude-session-transfer.mjs";
+import { describeFastMode } from "./lib/fast-mode.mjs";
 import { readStdinIfPiped } from "./lib/fs.mjs";
 import { collectReviewContext, ensureGitRepository, resolveReviewTarget } from "./lib/git.mjs";
-import { binaryAvailable, terminateProcessTree } from "./lib/process.mjs";
+import { stopJobProcesses } from "./lib/job-runtime.mjs";
+import { applyPluginOptionSettingsFallback } from "./lib/plugin-options.mjs";
+import { binaryAvailable } from "./lib/process.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
@@ -43,6 +46,7 @@ import {
   findActiveJob,
   readStoredJob,
   resolveActiveJob,
+  resolveJobReference,
   resolveResultJob,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
@@ -53,10 +57,11 @@ import {
   createJobRecord,
   createProgressReporter,
   nowIso,
+  patchJob,
   runTrackedJob,
   SESSION_ID_ENV
 } from "./lib/tracked-jobs.mjs";
-import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { resolveConfiguredWorkspaceRoot, resolveWorkspaceRoot } from "./lib/workspace.mjs";
 import {
   renderNativeReviewResult,
   renderReviewResult,
@@ -73,7 +78,7 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
-const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
+const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
 
@@ -84,7 +89,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
       "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--resume-job <job-id>|--resume-thread <thread-id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -127,7 +132,7 @@ function normalizeReasoningEffort(effort) {
   }
   if (!VALID_REASONING_EFFORTS.has(normalized)) {
     throw new Error(
-      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh.`
+      `Unsupported reasoning effort "${effort}". Use one of: none, minimal, low, medium, high, xhigh, max, ultra.`
     );
   }
   return normalized;
@@ -155,7 +160,7 @@ function parseCommandInput(argv, config = {}) {
 }
 
 function resolveCommandCwd(options = {}) {
-  return options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  return resolveConfiguredWorkspaceRoot() ?? (options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd());
 }
 
 function resolveCommandWorkspace(options = {}) {
@@ -211,6 +216,8 @@ async function buildSetupReport(cwd, actionsTaken = []) {
     npm: npmStatus,
     codex: codexStatus,
     codexHome: describeCodexHome(),
+    workspaceRoot: resolveConfiguredWorkspaceRoot() ?? workspaceRoot,
+    fastMode: describeFastMode(),
     taskApprovals: describeTaskApprovals(),
     auth: authStatus,
     sessionRuntime: getSessionRuntimeStatus(process.env, workspaceRoot),
@@ -341,26 +348,85 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
   };
 }
 
-async function resolveLatestTrackedTaskThread(cwd, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
-  const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
-  const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
-  if (activeTask) {
-    throw new Error(`Task ${activeTask.id} is still running. Use /codex:status before continuing it.`);
+// The queued or running job that is working on a Codex thread, if any. Two runs on one thread would
+// interleave their turns, so a thread can be resumed only once nothing else is running on it.
+function findJobUsingThread(jobs, threadId, excludeJobId = null) {
+  return (
+    jobs.find(
+      (job) =>
+        job.id !== excludeJobId &&
+        isActiveJobStatus(job.status) &&
+        (job.threadId === threadId || job.request?.resumeThreadId === threadId)
+    ) ?? null
+  );
+}
+
+function assertThreadIdle(jobs, threadId, excludeJobId = null) {
+  const busy = findJobUsingThread(jobs, threadId, excludeJobId);
+  if (busy) {
+    throw new Error(
+      `Codex thread ${threadId} is still in use by ${busy.status} job ${busy.id}. Steer it with /codex:steer ${busy.id}, wait for it to finish, or stop it with /codex:cancel ${busy.id}.`
+    );
+  }
+}
+
+// Picks the Codex thread a task continues: a specific job's thread (--resume-job), a thread id
+// (--resume-thread), or the newest finished task from this Claude session (--resume-last). Jobs running on
+// other threads never block a resume. Returns null when --resume-last finds no tracked task and the caller
+// should fall back to Codex's own thread list.
+function resolveTaskResumeTarget(workspaceRoot, { resumeLast = false, resumeJob = null, resumeThread = null, excludeJobId = null, fallbackWorkspaceRoot = null }) {
+  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== excludeJobId);
+
+  if (resumeJob) {
+    const { workspaceRoot: jobWorkspaceRoot, job } = resolveJobReference(workspaceRoot, resumeJob, (candidate) => candidate.jobClass === "task");
+    if (isActiveJobStatus(job.status)) {
+      throw new Error(`Job ${job.id} is still ${job.status}. Steer it with /codex:steer ${job.id}, or resume it once it finishes.`);
+    }
+    if (!job.threadId) {
+      throw new Error(`Job ${job.id} never started a Codex thread, so there is nothing to resume.`);
+    }
+    assertThreadIdle([...jobs, ...listJobs(jobWorkspaceRoot)], job.threadId, excludeJobId);
+    return { threadId: job.threadId, jobId: job.id, workspaceRoot: jobWorkspaceRoot };
   }
 
-  const trackedTask = findLatestResumableTaskJob(visibleJobs);
-  if (trackedTask) {
-    return { id: trackedTask.threadId };
+  if (resumeThread) {
+    assertThreadIdle(jobs, resumeThread, excludeJobId);
+    return { threadId: resumeThread, jobId: jobs.find((job) => job.threadId === resumeThread)?.id ?? null, workspaceRoot };
   }
 
-  if (sessionId) {
+  if (!resumeLast) {
+    return null;
+  }
+  const resumeWorkspaces = [...new Set([workspaceRoot, fallbackWorkspaceRoot].filter(Boolean))];
+  for (const resumeWorkspace of resumeWorkspaces) {
+    const candidates = resumeWorkspace === workspaceRoot ? jobs : sortJobsNewestFirst(listJobs(resumeWorkspace)).filter((job) => job.id !== excludeJobId);
+    const trackedTask = findLatestResumableTaskJob(filterJobsForCurrentClaudeSession(candidates));
+    if (trackedTask) {
+      assertThreadIdle([...jobs, ...candidates], trackedTask.threadId, excludeJobId);
+      return { threadId: trackedTask.threadId, jobId: trackedTask.id, workspaceRoot: resumeWorkspace };
+    }
+  }
+  if (getCurrentClaudeSessionId()) {
+    throw new Error("No previous Codex task thread was found for this repository.");
+  }
+  return null;
+}
+
+async function resolveResumeThreadId(workspaceRoot, request) {
+  if (request.resumeThreadId) {
+    return request.resumeThreadId;
+  }
+  if (!request.resumeLast) {
     return null;
   }
 
-  return findLatestTaskThread(workspaceRoot);
+  // Requests queued before the thread was chosen up front, or that found no tracked task, resolve here.
+  const target = resolveTaskResumeTarget(workspaceRoot, { resumeLast: true, excludeJobId: request.jobId });
+  const latestThread = target ? { id: target.threadId } : await findLatestTaskThread(workspaceRoot);
+  if (!latestThread) {
+    throw new Error("No previous Codex task thread was found for this repository.");
+  }
+  return latestThread.id;
 }
 
 async function executeReviewRun(request) {
@@ -472,36 +538,43 @@ async function executeTaskRun(request) {
 
   const taskMetadata = buildTaskRunMetadata({
     prompt: request.prompt,
-    resumeLast: request.resumeLast
+    resumeLast: Boolean(request.resumeLast || request.resumeThreadId)
   });
 
-  let resumeThreadId = null;
-  if (request.resumeLast) {
-    const latestThread = await resolveLatestTrackedTaskThread(workspaceRoot, {
-      excludeJobId: request.jobId
-    });
-    if (!latestThread) {
-      throw new Error("No previous Codex task thread was found for this repository.");
-    }
-    resumeThreadId = latestThread.id;
-  }
+  const resumeThreadId = await resolveResumeThreadId(workspaceRoot, request);
 
   if (!request.prompt && !resumeThreadId) {
     throw new Error("Provide a prompt, a prompt file, piped stdin, or use --resume-last.");
   }
 
-  const result = await runAppServerTurn(workspaceRoot, {
-    resumeThreadId,
-    prompt: request.prompt,
-    defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
-    model: request.model,
-    effort: request.effort,
-    sandbox: request.write ? "workspace-write" : "read-only",
-    ...resolveTaskApprovals(),
-    onProgress: request.onProgress,
-    persistThread: true,
-    threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT)
-  });
+  const jobId = request.jobId ?? null;
+  let result;
+  try {
+    result = await runAppServerTurn(request.cwd, {
+      resumeThreadId,
+      prompt: request.prompt,
+      defaultPrompt: resumeThreadId ? DEFAULT_CONTINUE_PROMPT : "",
+      model: request.model,
+      effort: request.effort,
+      sandbox: request.write ? "workspace-write" : "read-only",
+      ...resolveTaskApprovals(),
+      onProgress: request.onProgress,
+      persistThread: true,
+      threadName: resumeThreadId ? null : buildPersistentTaskThreadName(request.prompt || DEFAULT_CONTINUE_PROMPT),
+      // The job's own app server; steer and cancel find it through the endpoint recorded in the job.
+      jobRuntime: jobId
+        ? {
+            jobId,
+            onReady: ({ endpoint, appServerPid }) =>
+              patchJob(workspaceRoot, jobId, { transport: "job", controlEndpoint: endpoint, appServerPid })
+          }
+        : null
+    });
+  } finally {
+    if (jobId) {
+      patchJob(workspaceRoot, jobId, { controlEndpoint: null, appServerPid: null });
+    }
+  }
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
   const failureMessage = result.error?.message ?? result.stderr ?? "";
@@ -610,7 +683,7 @@ function buildTaskJob(workspaceRoot, taskMetadata, write) {
   });
 }
 
-function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId }) {
+function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, resumeThreadId = null, resumeJobId = null, jobId }) {
   return {
     cwd,
     model,
@@ -618,6 +691,8 @@ function buildTaskRequest({ cwd, model, effort, prompt, write, resumeLast, jobId
     prompt,
     write,
     resumeLast,
+    resumeThreadId,
+    resumeJobId,
     jobId
   };
 }
@@ -770,7 +845,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "resume-job", "resume-thread"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -784,46 +859,56 @@ async function handleTask(argv) {
   const prompt = readTaskPrompt(cwd, options, positionals);
 
   const resumeLast = Boolean(options["resume-last"] || options.resume);
+  const resumeJob = options["resume-job"] ? String(options["resume-job"]).trim() : null;
+  const resumeThread = options["resume-thread"] ? String(options["resume-thread"]).trim() : null;
   const fresh = Boolean(options.fresh);
-  if (resumeLast && fresh) {
-    throw new Error("Choose either --resume/--resume-last or --fresh.");
+  if ([resumeLast, Boolean(resumeJob), Boolean(resumeThread), fresh].filter(Boolean).length > 1) {
+    throw new Error("Choose only one of --resume/--resume-last, --resume-job, --resume-thread, or --fresh.");
   }
   const write = Boolean(options.write);
+
+  // Choose the thread now, so a queued resume holds on to the thread that was newest when it was asked for
+  // and later resumes can see that the thread is taken.
+  const configuredRoot = resolveConfiguredWorkspaceRoot();
+  const fallbackWorkspaceRoot = resumeLast && configuredRoot
+    ? resolveWorkspaceRoot(options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd())
+    : null;
+  const resumeTarget = resolveTaskResumeTarget(workspaceRoot, { resumeLast, resumeJob, resumeThread, fallbackWorkspaceRoot });
+  const taskCwd = configuredRoot ?? resumeTarget?.workspaceRoot ?? workspaceRoot;
+  const taskWorkspaceRoot = resolveWorkspaceRoot(taskCwd);
+  const resuming = resumeLast || Boolean(resumeTarget);
   const taskMetadata = buildTaskRunMetadata({
     prompt,
-    resumeLast
+    resumeLast: resuming
   });
+  const requestOptions = {
+    cwd: taskCwd,
+    model,
+    effort,
+    prompt,
+    write,
+    resumeLast: resumeLast && !resumeTarget,
+    resumeThreadId: resumeTarget?.threadId ?? null,
+    resumeJobId: resumeTarget?.jobId ?? null
+  };
 
   if (options.background) {
-    ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
+    ensureCodexAvailable(taskCwd);
+    requireTaskRequest(prompt, resuming);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-    const request = buildTaskRequest({
-      cwd,
-      model,
-      effort,
-      prompt,
-      write,
-      resumeLast,
-      jobId: job.id
-    });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const job = buildTaskJob(taskWorkspaceRoot, taskMetadata, write);
+    const request = buildTaskRequest({ ...requestOptions, jobId: job.id });
+    const { payload } = enqueueBackgroundTask(taskCwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const job = buildTaskJob(taskWorkspaceRoot, taskMetadata, write);
   await runForegroundCommand(
     job,
     (progress) =>
       executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
+        ...requestOptions,
         jobId: job.id,
         onProgress: progress
       }),
@@ -853,8 +938,9 @@ async function handleTaskWorker(argv) {
     throw new Error("Missing required --job-id for task-worker.");
   }
 
-  const cwd = resolveCommandCwd(options);
-  const workspaceRoot = resolveCommandWorkspace(options);
+  // A queued job keeps the workspace chosen at launch, even if plugin settings change before it starts.
+  const cwd = options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd();
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
@@ -969,12 +1055,15 @@ function handleTaskResumeCandidate(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+// The job's turn, and the control endpoint of the job's own runtime when it has one. Jobs without an
+// endpoint (reviews, or tasks started by older plugin versions) are reached through the workspace broker.
 function resolveJobTurn(workspaceRoot, job) {
   const existing = readStoredJob(workspaceRoot, job.id) ?? {};
   return {
     existing,
     threadId: existing.threadId ?? job.threadId ?? null,
-    turnId: existing.turnId ?? job.turnId ?? null
+    turnId: existing.turnId ?? job.turnId ?? null,
+    endpoint: existing.controlEndpoint ?? job.controlEndpoint ?? null
   };
 }
 
@@ -987,9 +1076,11 @@ async function handleCancel(argv) {
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveActiveJob(cwd, reference, { env: process.env, command: "cancel" });
-  const { existing, threadId, turnId } = resolveJobTurn(workspaceRoot, job);
+  const { existing, threadId, turnId, endpoint } = resolveJobTurn(workspaceRoot, job);
 
-  const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
+  // Interrupt first so Codex records the turn as interrupted, then stop every process the job started:
+  // interrupting a turn does not stop commands it left running in the background.
+  const interrupt = await interruptAppServerTurn(workspaceRoot, { threadId, turnId, endpoint });
   if (interrupt.attempted) {
     appendLogLine(
       job.logFile,
@@ -999,7 +1090,13 @@ async function handleCancel(argv) {
     );
   }
 
-  terminateProcessTree(job.pid ?? Number.NaN);
+  const stopped = await stopJobProcesses({ ...job, pid: job.pid ?? existing.pid ?? null, controlEndpoint: endpoint });
+  if (stopped.signalled > 0) {
+    appendLogLine(
+      job.logFile,
+      `Stopped ${stopped.signalled} process(es) started by the job${stopped.killed > 0 ? ` (${stopped.killed} needed SIGKILL)` : ""}.`
+    );
+  }
   appendLogLine(job.logFile, "Cancelled by user.");
 
   const completedAt = nowIso();
@@ -1008,6 +1105,8 @@ async function handleCancel(argv) {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
+    controlEndpoint: null,
+    appServerPid: null,
     completedAt,
     errorMessage: "Cancelled by user."
   };
@@ -1022,6 +1121,8 @@ async function handleCancel(argv) {
     status: "cancelled",
     phase: "cancelled",
     pid: null,
+    controlEndpoint: null,
+    appServerPid: null,
     errorMessage: "Cancelled by user.",
     completedAt
   });
@@ -1031,7 +1132,8 @@ async function handleCancel(argv) {
     status: "cancelled",
     title: job.title,
     turnInterruptAttempted: interrupt.attempted,
-    turnInterrupted: interrupt.interrupted
+    turnInterrupted: interrupt.interrupted,
+    processesStopped: stopped.signalled
   };
 
   outputCommandResult(payload, renderCancelReport(nextJob), options.json);
@@ -1053,9 +1155,9 @@ async function handleSteer(argv) {
   }
 
   const { workspaceRoot, job } = named ?? resolveActiveJob(cwd, "", { env: process.env, command: "steer" });
-  const { threadId, turnId } = resolveJobTurn(workspaceRoot, job);
+  const { threadId, turnId, endpoint } = resolveJobTurn(workspaceRoot, job);
 
-  const steer = await steerAppServerTurn(cwd, { threadId, turnId, prompt });
+  const steer = await steerAppServerTurn(workspaceRoot, { threadId, turnId, prompt, endpoint });
   if (steer.attempted) {
     appendLogLine(
       job.logFile,
@@ -1075,13 +1177,14 @@ async function handleSteer(argv) {
     detail: steer.detail
   };
 
-  outputCommandResult(payload, renderSteerReport(job, steer), options.json);
+  outputCommandResult(payload, renderSteerReport(job, steer, { ownRuntime: Boolean(endpoint) }), options.json);
   if (!steer.steered) {
     process.exitCode = 1;
   }
 }
 
 async function main() {
+  applyPluginOptionSettingsFallback();
   applyConfiguredCodexHome();
   const [subcommand, ...argv] = process.argv.slice(2);
   if (!subcommand || subcommand === "help" || subcommand === "--help") {

@@ -137,7 +137,7 @@ Use it when you want Codex to:
 > [!NOTE]
 > Depending on the task and the model you choose these tasks might take a long time and it's generally recommended to force the task to be in the background or move the agent to the background.
 
-It supports `--background`, `--wait`, `--resume`, and `--fresh`. If you omit `--resume` and `--fresh`, the plugin can offer to continue the latest rescue thread for this repo.
+It supports `--background`, `--wait`, `--resume`, `--resume-job <job-id>`, and `--fresh`. If you omit them, the plugin can offer to continue the latest rescue thread for this repo. `--resume` continues the newest finished rescue task from this session; `--resume-job` continues a specific one, even while other Codex tasks are running.
 
 Examples:
 
@@ -145,6 +145,7 @@ Examples:
 /codex:rescue investigate why the tests started failing
 /codex:rescue fix the failing test with the smallest safe patch
 /codex:rescue --resume apply the top fix from the last run
+/codex:rescue --resume-job task-abc123 now add the regression test
 /codex:rescue --model gpt-5.4-mini --effort medium investigate the flaky integration test
 /codex:rescue --model spark fix the issue quickly
 /codex:rescue --background investigate the regression
@@ -161,6 +162,8 @@ Ask Codex to redesign the database connection to be more resilient.
 - if you do not pass `--model` or `--effort`, Codex chooses its own defaults.
 - if you say `spark`, the plugin maps that to `gpt-5.3-codex-spark`
 - follow-up rescue requests can continue the latest Codex task in the repo
+- every rescue task runs on a Codex app server of its own, so several tasks can run at once in one repo and each can be steered, cancelled, and resumed on its own
+- Codex lets one app server at a time open a thread. If the repo's shared runtime still holds the thread you resume (from a task run by an older plugin version), the plugin stops that runtime when it is idle; a thread open in the Codex app or a `codex resume` session must be closed there first
 
 ### `/codex:transfer`
 
@@ -179,7 +182,7 @@ The plugin's existing `SessionStart` hook supplies the current transcript path a
 
 ### `/codex:status`
 
-Shows running and recent Codex jobs for the current repository.
+Shows running and recent Codex jobs for the current repository, plus jobs from this session that are running in other repositories.
 
 Examples:
 
@@ -208,7 +211,7 @@ Examples:
 
 ### `/codex:cancel`
 
-Cancels an active background Codex job.
+Cancels an active background Codex job. It interrupts the Codex turn and then stops every process the job started, including commands Codex left running in the background, without touching other jobs.
 
 Examples:
 
@@ -232,9 +235,9 @@ Examples:
 
 **Notes:**
 
-- once the turn has finished, use `/codex:rescue --resume` instead
-- a job that started while another Codex job was running gets its own app server and cannot be steered
+- once the turn has finished, use `/codex:rescue --resume` (or `--resume-job <job-id>`) instead
 - native `/codex:review` turns cannot be steered
+- `/codex:status`, `/codex:result`, `/codex:cancel`, and `/codex:steer` accept the full id of a job that runs in another repository
 
 ### `/codex:setup`
 
@@ -305,11 +308,60 @@ Your configuration will be picked up based on:
 
 Check out the Codex docs for more [configuration options](https://developers.openai.com/codex/config-reference).
 
+### Workspace Root
+
+The optional `workspace_root` plugin setting chooses the working directory for new and resumed Codex
+sessions, including reviews. It overrides `--cwd` and a resumed job's original repository. Set it to an
+existing directory; `~` and `$HOME` are expanded. Leaving it empty keeps the current workspace for new
+tasks and the source job's workspace when resuming by job ID.
+
+For example, in your Claude Code user settings (`~/.claude/settings.json`):
+
+```json
+{
+  "pluginConfigs": {
+    "codex@openai-codex": {
+      "options": {
+        "workspace_root": "~/projects/my-repo"
+      }
+    }
+  }
+}
+```
+
+`/codex:setup` shows the effective workspace root. Job status, results, and the review gate also use the
+configured workspace. A resumed job runs in its source repository unless `workspace_root` overrides it.
+
+### Fast Mode
+
+The plugin's `fast_mode` option defaults to `false`. Enable it to use priority processing for Codex reviews,
+rescue tasks, and stop-time reviews. When disabled, the plugin clears priority mode for new and resumed
+threads, overriding the service tier in your Codex configuration.
+
+For example, set it in your Claude Code user settings (`~/.claude/settings.json`):
+
+```json
+{
+  "pluginConfigs": {
+    "codex@openai-codex": {
+      "options": {
+        "fast_mode": true
+      }
+    }
+  }
+}
+```
+
+`/codex:setup` shows the current setting. See the [Codex speed documentation](https://learn.chatgpt.com/docs/agent-configuration/speed)
+for supported models and usage rates.
+
 ### Auto-Review Approvals
 
 By default the plugin runs every Codex thread with `approval_policy = "never"`, whatever your `config.toml` says, so Codex never stops to ask and stays inside its sandbox.
 
 Turn on the plugin's `auto_review` option to let `/codex:rescue` tasks ask for escalations such as writes outside the sandbox or network access. Codex's auto-review subagent approves or denies each request (`approval_policy = "on-request"` with `approvals_reviewer = "auto_review"`). `/codex:review`, `/codex:adversarial-review`, and the stop-time review gate are unaffected. `/codex:setup` shows the current setting.
+
+A session picks up plugin options when it starts. If you set an option in a session that started before it existed, the plugin reads it from your Claude Code settings instead.
 
 ### Moving The Work Over To Codex
 
@@ -335,9 +387,11 @@ That means:
 - it uses the same local authentication state
 - it uses the same repository checkout and machine-local environment
 
+Each rescue task starts its own `codex app-server` and stops it when the task ends. Reviews and quick status checks share one app server per repository, which shuts itself down after 15 minutes without use (set `CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS` to change that).
+
 ### Will it use the same Codex config I already have?
 
-Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations). The exception is approvals, which the plugin sets itself (see [Auto-Review Approvals](#auto-review-approvals)).
+Yes. If you already use Codex, the plugin picks up the same [configuration](#common-configurations). Its [workspace_root option](#workspace-root) chooses the working directory, it sets [approvals](#auto-review-approvals) itself, and its [fast_mode option](#fast-mode) controls priority processing.
 
 ### Can I keep using my current API key or base URL setup?
 

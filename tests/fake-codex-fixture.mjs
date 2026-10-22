@@ -12,10 +12,93 @@ const fs = require("node:fs");
 const crypto = require("node:crypto");
 const path = require("node:path");
 const readline = require("node:readline");
+const { spawn } = require("node:child_process");
 
 	const STATE_PATH = ${JSON.stringify(statePath)};
 	const BEHAVIOR = ${JSON.stringify(behavior)};
 	const interruptibleTurns = new Map();
+	const STATE_LOCK_PATH = STATE_PATH + ".lock";
+	const sleepCell = new Int32Array(new SharedArrayBuffer(4));
+
+	// Jobs each run their own app server, so several fake app servers can update the state file at once.
+	function withStateLock(fn) {
+	  const deadline = Date.now() + 5000;
+	  let locked = false;
+	  while (!locked && Date.now() < deadline) {
+	    try {
+	      fs.mkdirSync(STATE_LOCK_PATH);
+	      locked = true;
+	    } catch (error) {
+	      if (error.code !== "EEXIST") {
+	        break;
+	      }
+	      try {
+	        if (Date.now() - fs.statSync(STATE_LOCK_PATH).mtimeMs > 2000) {
+	          fs.rmdirSync(STATE_LOCK_PATH);
+	          continue;
+	        }
+	      } catch {}
+	      Atomics.wait(sleepCell, 0, 0, 2);
+	    }
+	  }
+	  try {
+	    return fn();
+	  } finally {
+	    if (locked) {
+	      try { fs.rmdirSync(STATE_LOCK_PATH); } catch {}
+	    }
+	  }
+	}
+
+	// Like Codex: one app server at a time may load a persisted thread. It holds the thread's writer lock until
+	// it exits; thread/unsubscribe does not unload the thread.
+	const loadedThreads = new Set();
+
+	function processIsAlive(pid) {
+	  if (!pid || pid === process.pid) {
+	    return false;
+	  }
+	  try {
+	    process.kill(pid, 0);
+	  } catch {
+	    return false;
+	  }
+	  try {
+	    return !/^\\S+ \\(.*\\) [ZX]/.test(fs.readFileSync("/proc/" + pid + "/stat", "utf8"));
+	  } catch {
+	    return true;
+	  }
+	}
+
+	function loadThread(threadId) {
+	  const lockPath = path.join(path.dirname(STATE_PATH), "thread-locks", threadId);
+	  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
+	  const holder = fs.existsSync(lockPath) ? Number(fs.readFileSync(lockPath, "utf8")) : null;
+	  if (processIsAlive(holder)) {
+	    throw new Error("thread " + threadId + " already has an active writer");
+	  }
+	  fs.writeFileSync(lockPath, String(process.pid));
+	  loadedThreads.add(threadId);
+	}
+
+	// Like commands Codex leaves running in the background: a command in its own process group with a worker
+	// of its own, and a daemon that detached from its launcher (so it is no longer below the app server).
+	// Each process writes its pid to procs-<turnId>/<name> next to the state file.
+	function spawnBackgroundWork(turnId) {
+	  const dir = path.join(path.dirname(STATE_PATH), "procs-" + turnId);
+	  fs.mkdirSync(dir, { recursive: true });
+	  const sleeper = "require('fs').writeFileSync(process.argv[1], String(process.pid)); setInterval(() => {}, 1000);";
+	  const command =
+	    "const { spawn } = require('child_process');" +
+	    "spawn(process.execPath, ['-e', process.argv[2], process.argv[1] + '/worker'], { stdio: 'ignore' });" +
+	    "require('fs').writeFileSync(process.argv[1] + '/command', String(process.pid));" +
+	    "setInterval(() => {}, 1000);";
+	  spawn(process.execPath, ["-e", command, dir, sleeper], { detached: true, stdio: "ignore" }).unref();
+	  const launcher =
+	    "const { spawn } = require('child_process');" +
+	    "spawn(process.execPath, ['-e', process.argv[2], process.argv[1] + '/daemon'], { detached: true, stdio: 'ignore' }).unref();";
+	  spawn(process.execPath, ["-e", launcher, dir, sleeper], { detached: true, stdio: "ignore" }).unref();
+	}
 
 	function loadState() {
 	  if (!fs.existsSync(STATE_PATH)) {
@@ -151,8 +234,10 @@ function inputText(input) {
     .join("\\n");
 }
 
-function threadApprovalParams(params) {
+function threadConfigParams(params) {
   return {
+    serviceTier: params.serviceTier,
+    config: params.config,
     approvalPolicy: params.approvalPolicy ?? null,
     approvalsReviewer: params.approvalsReviewer ?? null,
     sandbox: params.sandbox ?? null
@@ -290,9 +375,11 @@ if (args[0] === "login") {
 if (args[0] !== "app-server") {
   process.exit(1);
 }
-const bootState = loadState();
-bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
-saveState(bootState);
+withStateLock(() => {
+  const bootState = loadState();
+  bootState.appServerStarts = (bootState.appServerStarts || 0) + 1;
+  saveState(bootState);
+});
 
 const rl = readline.createInterface({ input: process.stdin });
 rl.on("line", (line) => {
@@ -301,6 +388,14 @@ rl.on("line", (line) => {
   }
 
   const message = JSON.parse(line);
+  if (message.method === "test/delay") {
+    setTimeout(() => send({ id: message.id, result: {} }), message.params.ms);
+    return;
+  }
+  withStateLock(() => handleMessage(message));
+});
+
+function handleMessage(message) {
   const state = loadState();
 
   try {
@@ -332,8 +427,11 @@ rl.on("line", (line) => {
         if (requiresExperimental("persistExtendedHistory", message, state) || requiresExperimental("persistFullHistory", message, state)) {
           throw new Error("thread/start.persistFullHistory requires experimentalApi capability");
         }
-        state.lastThreadStart = threadApprovalParams(message.params);
+        state.lastThreadStart = threadConfigParams(message.params);
         const thread = nextThread(state, message.params.cwd, message.params.ephemeral);
+        if (!message.params.ephemeral) {
+          loadThread(thread.id);
+        }
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         send({ method: "thread/started", params: { thread: { id: thread.id } } });
         break;
@@ -366,12 +464,22 @@ rl.on("line", (line) => {
           throw new Error("thread/resume.persistFullHistory requires experimentalApi capability");
         }
         const thread = ensureThread(state, message.params.threadId);
+        loadThread(thread.id);
+        thread.cwd = message.params.cwd ?? thread.cwd;
         thread.updatedAt = now();
-        state.lastThreadResume = threadApprovalParams(message.params);
+        state.lastThreadResume = threadConfigParams(message.params);
         saveState(state);
         send({ id: message.id, result: { thread: buildThread(thread), model: message.params.model || "gpt-5.4", modelProvider: "openai", serviceTier: null, cwd: thread.cwd, approvalPolicy: "never", sandbox: { type: "readOnly", access: { type: "fullAccess" }, networkAccess: false }, reasoningEffort: null } });
         break;
       }
+
+      case "thread/loaded/list":
+        send({ id: message.id, result: { data: [...loadedThreads], nextCursor: null } });
+        break;
+
+      case "thread/unsubscribe":
+        send({ id: message.id, result: { status: loadedThreads.has(message.params.threadId) ? "unsubscribed" : "notLoaded" } });
+        break;
 
       case "externalAgentConfig/import": {
         if (BEHAVIOR === "external-import-unsupported") {
@@ -466,6 +574,7 @@ rl.on("line", (line) => {
 	        state.lastTurnStart = {
 	          threadId: message.params.threadId,
 	          turnId,
+	          cwd: thread.cwd,
 	          model: message.params.model ?? null,
 	          effort: message.params.effort ?? null,
 	          prompt
@@ -604,8 +713,11 @@ rl.on("line", (line) => {
           }
         ];
 
-	        if (BEHAVIOR === "interruptible-slow-task") {
+	        if (BEHAVIOR === "interruptible-slow-task" || BEHAVIOR === "background-processes") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          if (BEHAVIOR === "background-processes") {
+	            spawnBackgroundWork(turnId);
+	          }
 	          const timer = setTimeout(() => {
 	            if (!interruptibleTurns.has(turnId)) {
 	              return;
@@ -617,7 +729,7 @@ rl.on("line", (line) => {
 	              }
 	            }
 	            send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "completed") } });
-	          }, 5000);
+	          }, Number(process.env.FAKE_CODEX_TURN_MS) || (BEHAVIOR === "background-processes" ? 30000 : 5000));
 	          interruptibleTurns.set(turnId, { threadId: thread.id, timer });
 	        } else if (BEHAVIOR === "slow-task") {
 	          emitTurnCompletedLater(thread.id, turnId, items, 400);
@@ -671,7 +783,7 @@ rl.on("line", (line) => {
   } catch (error) {
     send({ id: message.id, error: { code: -32000, message: error.message } });
   }
-});
+}
 `;
   writeExecutable(scriptPath, source);
 

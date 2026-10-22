@@ -40,8 +40,10 @@ import path from "node:path";
 
 import { readJsonFile } from "./fs.mjs";
 import { BROKER_BUSY_RPC_CODE, BROKER_ENDPOINT_ENV, CodexAppServerClient } from "./app-server.mjs";
-import { loadBrokerSession } from "./broker-lifecycle.mjs";
+import { loadBrokerSession, releaseThreadFromBroker } from "./broker-lifecycle.mjs";
 import { resolveCodexHome } from "./codex-home.mjs";
+import { resolveFastModeSettings } from "./fast-mode.mjs";
+import { withJobRuntime } from "./job-runtime.mjs";
 import { binaryAvailable } from "./process.mjs";
 
 const SERVICE_NAME = "claude_code_codex_plugin";
@@ -50,6 +52,8 @@ const DEFAULT_CONTINUE_PROMPT =
   "Continue from the current thread state. Pick the next highest-value step and follow through until the task is resolved.";
 const EXTERNAL_AGENT_IMPORT_COMPLETED = "externalAgentConfig/import/completed";
 const EXTERNAL_AGENT_IMPORT_TIMEOUT_MS = 2 * 60 * 1000;
+const TURN_CONTROL_TIMEOUT_MS = 15 * 1000;
+const THREAD_RELEASE_WAIT_MS = 5 * 1000;
 
 function cleanCodexStderr(stderr) {
   return stderr
@@ -64,6 +68,7 @@ function buildThreadParams(cwd, options = {}) {
   return {
     cwd,
     model: options.model ?? null,
+    ...resolveFastModeSettings(),
     approvalPolicy: options.approvalPolicy ?? "never",
     approvalsReviewer: options.approvalsReviewer ?? null,
     sandbox: options.sandbox ?? "read-only",
@@ -78,6 +83,7 @@ function buildResumeParams(threadId, cwd, options = {}) {
     threadId,
     cwd,
     model: options.model ?? null,
+    ...resolveFastModeSettings(),
     approvalPolicy: options.approvalPolicy ?? "never",
     approvalsReviewer: options.approvalsReviewer ?? null,
     sandbox: options.sandbox ?? "read-only"
@@ -590,8 +596,10 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     if (state.turnId) {
       state.threadTurnIds.set(state.threadId, state.turnId);
     }
+    // Replay what arrived before the turn id was known the same way the live handler above treats it,
+    // including thread announcements, which carry no threadId of their own.
     for (const message of state.bufferedNotifications) {
-      if (belongsToTurn(state, message)) {
+      if (message.method === "thread/started" || message.method === "thread/name/updated" || belongsToTurn(state, message)) {
         applyTurnNotification(state, message);
       } else {
         if (previousHandler) {
@@ -747,6 +755,51 @@ async function startThread(client, cwd, options = {}) {
 
 async function resumeThread(client, threadId, cwd, options = {}) {
   return client.request("thread/resume", buildResumeParams(threadId, cwd, options));
+}
+
+function isActiveWriterError(error) {
+  return /already has an active writer/i.test(String(error?.message ?? ""));
+}
+
+// Resumes a thread on a job's own app server. Codex lets one app server at a time load a thread, so this
+// fails while another one still has it loaded: typically the workspace's shared broker, which keeps every
+// thread it ran (tasks from older plugin versions ran there). Free the thread from an idle broker, then wait
+// briefly for the lock to clear; anything else holding it (the Codex app, `codex resume`) must be closed.
+async function resumeThreadOnJobRuntime(client, threadId, cwd, options = {}, onProgress = null) {
+  try {
+    return await resumeThread(client, threadId, cwd, options);
+  } catch (error) {
+    if (!isActiveWriterError(error)) {
+      throw error;
+    }
+  }
+
+  const released = await releaseThreadFromBroker(cwd, threadId);
+  if (released === "busy") {
+    throw new Error(
+      `Codex thread ${threadId} may still be loaded in this workspace's shared Codex runtime, which another job is using right now. Resume it again once that job finishes.`
+    );
+  }
+  if (released === "released") {
+    emitProgress(onProgress, `Stopped the idle shared Codex runtime, which still had thread ${threadId} loaded.`, "starting");
+  }
+
+  const deadline = Date.now() + THREAD_RELEASE_WAIT_MS;
+  let lastError = null;
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    try {
+      return await resumeThread(client, threadId, cwd, options);
+    } catch (error) {
+      if (!isActiveWriterError(error)) {
+        throw error;
+      }
+      lastError = error;
+    }
+  }
+  throw new Error(
+    `Codex thread ${threadId} is open in another Codex app server, such as the Codex app or a \`codex resume\` session. Close it there, then resume again. (${lastError?.message ?? "active writer"})`
+  );
 }
 
 function buildResultStatus(turnState) {
@@ -955,31 +1008,46 @@ export async function getCodexAuthStatus(cwd, options = {}) {
   }
 }
 
-// Sends a request that acts on an in-flight turn, through the shared runtime that is running it.
-async function requestActiveTurn(cwd, method, params, successDetail) {
-  const availability = getCodexAvailability(cwd);
-  if (!availability.available) {
-    return { attempted: false, ok: false, transport: null, detail: availability.detail };
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+// Sends a request that acts on an in-flight turn, through the runtime that is running it: the job's own
+// control endpoint when it has one, otherwise the workspace's shared broker.
+async function requestActiveTurn(cwd, method, params, successDetail, options = {}) {
+  const endpoint = options.endpoint ?? null;
+  if (!endpoint) {
+    const availability = getCodexAvailability(cwd);
+    if (!availability.available) {
+      return { attempted: false, ok: false, transport: null, detail: availability.detail };
+    }
   }
 
   let client = null;
+  const transport = () => (endpoint ? "job" : client?.transport ?? null);
   try {
-    client = await CodexAppServerClient.connect(cwd, { reuseExistingBroker: true });
-    await client.request(method, params);
-    return { attempted: true, ok: true, transport: client.transport, detail: successDetail };
+    client = await CodexAppServerClient.connect(cwd, endpoint ? { brokerEndpoint: endpoint } : { reuseExistingBroker: true });
+    const timeoutMs = options.timeoutMs ?? TURN_CONTROL_TIMEOUT_MS;
+    await withTimeout(client.request(method, params), timeoutMs, `Codex did not answer ${method} within ${Math.round(timeoutMs / 1000)}s.`);
+    return { attempted: true, ok: true, transport: transport(), detail: successDetail };
   } catch (error) {
-    return {
-      attempted: true,
-      ok: false,
-      transport: client?.transport ?? null,
-      detail: error instanceof Error ? error.message : String(error)
-    };
+    const detail =
+      endpoint && (error?.code === "ENOENT" || error?.code === "ECONNREFUSED")
+        ? "the job's Codex runtime is no longer running"
+        : error instanceof Error
+          ? error.message
+          : String(error);
+    return { attempted: true, ok: false, transport: transport(), detail };
   } finally {
     await client?.close().catch(() => {});
   }
 }
 
-export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
+export async function interruptAppServerTurn(cwd, { threadId, turnId, endpoint = null, timeoutMs }) {
   if (!threadId || !turnId) {
     return { attempted: false, interrupted: false, transport: null, detail: "missing threadId or turnId" };
   }
@@ -987,12 +1055,13 @@ export async function interruptAppServerTurn(cwd, { threadId, turnId }) {
     cwd,
     "turn/interrupt",
     { threadId, turnId },
-    `Interrupted ${turnId} on ${threadId}.`
+    `Interrupted ${turnId} on ${threadId}.`,
+    { endpoint, timeoutMs }
   );
   return { ...result, interrupted: ok };
 }
 
-export async function steerAppServerTurn(cwd, { threadId, turnId, prompt }) {
+export async function steerAppServerTurn(cwd, { threadId, turnId, prompt, endpoint = null, timeoutMs }) {
   if (!threadId || !turnId) {
     return { attempted: false, steered: false, transport: null, detail: "the job has not started a Codex turn yet" };
   }
@@ -1000,7 +1069,8 @@ export async function steerAppServerTurn(cwd, { threadId, turnId, prompt }) {
     cwd,
     "turn/steer",
     { threadId, expectedTurnId: turnId, input: buildTurnInput(prompt) },
-    `Steered ${turnId} on ${threadId}.`
+    `Steered ${turnId} on ${threadId}.`,
+    { endpoint, timeoutMs }
   );
   return { ...result, steered: ok };
 }
@@ -1104,7 +1174,12 @@ export async function runAppServerTurn(cwd, options = {}) {
     throw new Error("Codex CLI is not installed or is missing required runtime support. Install it with `npm install -g @openai/codex`, then rerun `/codex:setup`.");
   }
 
-  return withAppServer(cwd, async (client) => {
+  // A tracked task gets an app server of its own, so it never waits on, or falls back from, a busy shared broker.
+  const withRuntime = options.jobRuntime
+    ? (fn) => withJobRuntime(cwd, options.jobRuntime, fn)
+    : (fn) => withAppServer(cwd, fn);
+
+  return withRuntime(async (client) => {
     let threadId;
 
     const threadOptions = {
@@ -1116,10 +1191,10 @@ export async function runAppServerTurn(cwd, options = {}) {
 
     if (options.resumeThreadId) {
       emitProgress(options.onProgress, `Resuming thread ${options.resumeThreadId}.`, "starting");
-      const response = await resumeThread(client, options.resumeThreadId, cwd, {
-        ...threadOptions,
-        ephemeral: false
-      });
+      const resumeOptions = { ...threadOptions, ephemeral: false };
+      const response = options.jobRuntime
+        ? await resumeThreadOnJobRuntime(client, options.resumeThreadId, cwd, resumeOptions, options.onProgress)
+        : await resumeThread(client, options.resumeThreadId, cwd, resumeOptions);
       threadId = response.thread.id;
     } else {
       emitProgress(options.onProgress, "Starting Codex task thread.", "starting");

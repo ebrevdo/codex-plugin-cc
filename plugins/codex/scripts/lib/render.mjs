@@ -123,6 +123,9 @@ function appendActiveJobsTable(lines, jobs) {
 
 function pushJobDetails(lines, job, options = {}) {
   lines.push(`- ${formatJobLine(job)}`);
+  if (options.workspaceRoot && job.workspaceRoot && job.workspaceRoot !== options.workspaceRoot) {
+    lines.push(`  Workspace: ${job.workspaceRoot}`);
+  }
   if (job.summary) {
     lines.push(`  Summary: ${job.summary}`);
   }
@@ -185,6 +188,8 @@ export function renderSetupReport(report) {
     `- npm: ${report.npm.detail}`,
     `- codex: ${report.codex.detail}`,
     `- codex home: ${report.codexHome.path} (${report.codexHome.source})`,
+    `- workspace root: ${report.workspaceRoot}`,
+    `- fast mode: ${report.fastMode.enabled ? "enabled" : "disabled"} (${report.fastMode.source})`,
     `- task approvals: ${report.taskApprovals.mode} (${report.taskApprovals.source})`,
     `- auth: ${report.auth.detail}`,
     `- session runtime: ${report.sessionRuntime.label}`,
@@ -339,6 +344,7 @@ export function renderStatusReport(report) {
     lines.push("Live details:");
     for (const job of report.running) {
       pushJobDetails(lines, job, {
+        workspaceRoot: report.workspaceRoot,
         showElapsed: true,
         showLog: true
       });
@@ -466,7 +472,7 @@ export function renderCancelReport(job) {
   return `${lines.join("\n").trimEnd()}\n`;
 }
 
-export function renderSteerReport(job, steer) {
+export function renderSteerReport(job, steer, options = {}) {
   const lines = [
     "# Codex Steer",
     "",
@@ -483,10 +489,14 @@ export function renderSteerReport(job, steer) {
   if (steer.steered) {
     lines.push("- Codex picks up the instructions mid-turn. Check `/codex:status` to follow along.");
   } else if (steer.attempted) {
-    lines.push("- If the turn already finished, send the instructions with `/codex:rescue --resume` instead.");
     lines.push(
-      "- A job that started while another Codex job held the shared runtime runs on its own app server and cannot be steered; use `/codex:cancel` and `/codex:rescue --resume`."
+      `- If the turn already finished, continue the thread with \`/codex:rescue --resume\` or \`task --resume-job ${job.id}\` instead.`
     );
+    if (!options.ownRuntime) {
+      lines.push(
+        "- This job was started by an older plugin version. If it fell back to a private app server because the shared runtime was busy, it cannot be steered; use `/codex:cancel` and resume it."
+      );
+    }
   }
 
   return `${lines.join("\n").trimEnd()}\n`;

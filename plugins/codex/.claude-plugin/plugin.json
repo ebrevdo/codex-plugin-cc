@@ -12,6 +12,18 @@
       "description": "CODEX_HOME directory for every Codex process this plugin starts (auth, config, sessions). Overrides CODEX_HOME from your shell. ~ and $HOME are expanded.",
       "default": "~/.codex"
     },
+    "workspace_root": {
+      "type": "directory",
+      "title": "Workspace root",
+      "description": "Optional working directory for new and resumed Codex sessions. Overrides --cwd and a resumed job's original workspace when set. Leave empty to use the current workspace or the resumed job's workspace. ~ and $HOME are expanded.",
+      "default": ""
+    },
+    "fast_mode": {
+      "type": "boolean",
+      "title": "Fast mode",
+      "description": "Run Codex reviews and tasks with priority processing. When off, sessions use standard processing even if your Codex config enables priority mode.",
+      "default": false
+    },
     "auto_review": {
       "type": "boolean",
       "title": "Auto-review approvals",

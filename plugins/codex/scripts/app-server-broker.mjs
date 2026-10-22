@@ -6,12 +6,11 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import { BROKER_BUSY_RPC_CODE, CodexAppServerClient, TURN_CONTROL_METHODS } from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
+import { computeBrokerBuildId, resolveBrokerIdleTimeoutMs } from "./lib/broker-lifecycle.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
-// Requests another client may send while a turn streams to its owner: stopping or steering that turn.
-const TURN_CONTROL_METHODS = new Set(["turn/interrupt", "turn/steer"]);
 
 function buildStreamThreadIds(method, params, result) {
   const threadIds = new Set();
@@ -47,14 +46,24 @@ function writePidFile(pidFile) {
   fs.writeFileSync(pidFile, `${process.pid}\n`, "utf8");
 }
 
+function removeQuietly(filePath) {
+  try {
+    fs.rmSync(filePath, { force: true });
+  } catch {
+    // Someone else (such as the SessionEnd hook) may be tearing down the same files.
+  }
+}
+
 async function main() {
   const [subcommand, ...argv] = process.argv.slice(2);
   if (subcommand !== "serve") {
-    throw new Error("Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>]");
+    throw new Error(
+      "Usage: node scripts/app-server-broker.mjs serve --endpoint <value> [--cwd <path>] [--pid-file <path>] [--log-file <path>]"
+    );
   }
 
   const { options } = parseArgs(argv, {
-    valueOptions: ["cwd", "pid-file", "endpoint"]
+    valueOptions: ["cwd", "pid-file", "log-file", "endpoint"]
   });
 
   if (!options.endpoint) {
@@ -65,12 +74,17 @@ async function main() {
   const endpoint = String(options.endpoint);
   const listenTarget = parseBrokerEndpoint(endpoint);
   const pidFile = options["pid-file"] ? path.resolve(options["pid-file"]) : null;
+  const logFile = options["log-file"] ? path.resolve(options["log-file"]) : null;
+  const buildId = computeBrokerBuildId();
+  const idleTimeoutMs = resolveBrokerIdleTimeoutMs();
   writePidFile(pidFile);
 
   const appClient = await CodexAppServerClient.connect(cwd, { disableBroker: true });
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let idleTimer = null;
+  let shutdownPromise = null;
   const sockets = new Set();
 
   function clearSocketOwnership(socket) {
@@ -101,24 +115,55 @@ async function main() {
     }
   }
 
-  async function shutdown(server) {
-    for (const socket of sockets) {
-      socket.end();
+  function shutdown(server) {
+    shutdownPromise ??= (async () => {
+      clearTimeout(idleTimer);
+      for (const socket of sockets) {
+        socket.end();
+      }
+      await appClient.close().catch(() => {});
+      await new Promise((resolve) => server.close(resolve));
+      if (listenTarget.kind === "unix") {
+        removeQuietly(listenTarget.path);
+      }
+      if (pidFile) {
+        removeQuietly(pidFile);
+      }
+      if (logFile) {
+        removeQuietly(logFile);
+      }
+      // The session directory only holds the files above; leave it when anything else is in it.
+      const sessionDir = pidFile ? path.dirname(pidFile) : null;
+      if (sessionDir) {
+        try {
+          fs.rmdirSync(sessionDir);
+        } catch {
+          // Not empty or already removed.
+        }
+      }
+    })();
+    return shutdownPromise;
+  }
+
+  // A broker nobody has connected to for a while shuts down, so brokers for workspaces the user moved on
+  // from do not keep a Codex app server running for hours. The next command starts a fresh one.
+  function scheduleIdleShutdown(server) {
+    clearTimeout(idleTimer);
+    idleTimer = null;
+    if (sockets.size > 0 || !idleTimeoutMs) {
+      return;
     }
-    await appClient.close().catch(() => {});
-    await new Promise((resolve) => server.close(resolve));
-    if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) {
-      fs.unlinkSync(listenTarget.path);
-    }
-    if (pidFile && fs.existsSync(pidFile)) {
-      fs.unlinkSync(pidFile);
-    }
+    idleTimer = setTimeout(async () => {
+      await shutdown(server);
+      process.exit(0);
+    }, idleTimeoutMs);
   }
 
   appClient.setNotificationHandler(routeNotification);
 
   const server = net.createServer((socket) => {
     sockets.add(socket);
+    clearTimeout(idleTimer);
     socket.setEncoding("utf8");
     let buffer = "";
 
@@ -169,21 +214,18 @@ async function main() {
           continue;
         }
 
-        const allowTurnControlDuringActiveStream =
-          isTurnControlRequest(message) && activeStreamSocket && activeStreamSocket !== socket && !activeRequestSocket;
+        const busyForSocket =
+          Boolean(activeRequestSocket && activeRequestSocket !== socket) || Boolean(activeStreamSocket && activeStreamSocket !== socket);
 
-        if (
-          ((activeRequestSocket && activeRequestSocket !== socket) || (activeStreamSocket && activeStreamSocket !== socket)) &&
-          !allowTurnControlDuringActiveStream
-        ) {
-          send(socket, {
-            id: message.id,
-            error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
-          });
+        if (message.method === "broker/status") {
+          send(socket, { id: message.id, result: { buildId, pid: process.pid, busy: busyForSocket } });
           continue;
         }
 
-        if (allowTurnControlDuringActiveStream) {
+        // Stopping or steering a running turn goes straight to Codex: it never waits for, or takes over, the
+        // broker, whoever owns the stream and whatever request is in flight. So does asking which threads the
+        // broker holds, which a job needs to know before it can resume one of them elsewhere.
+        if (isTurnControlRequest(message) || message.method === "thread/loaded/list") {
           try {
             const result = await appClient.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
@@ -193,6 +235,14 @@ async function main() {
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
             });
           }
+          continue;
+        }
+
+        if (busyForSocket) {
+          send(socket, {
+            id: message.id,
+            error: buildJsonRpcError(BROKER_BUSY_RPC_CODE, "Shared Codex broker is busy.")
+          });
           continue;
         }
 
@@ -227,11 +277,13 @@ async function main() {
     socket.on("close", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      scheduleIdleShutdown(server);
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
       clearSocketOwnership(socket);
+      scheduleIdleShutdown(server);
     });
   });
 
@@ -245,7 +297,7 @@ async function main() {
     process.exit(0);
   });
 
-  server.listen(listenTarget.path);
+  server.listen(listenTarget.path, () => scheduleIdleShutdown(server));
 }
 
 main().catch((error) => {

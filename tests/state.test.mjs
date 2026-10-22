@@ -103,3 +103,27 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .sort()
   );
 });
+
+test("concurrent job updates from several processes are all kept", async () => {
+  const workspace = makeTempDir();
+  const stateModule = new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url).href;
+  const writer = `
+    const { upsertJob } = await import(${JSON.stringify(stateModule)});
+    const [workspace, prefix] = process.argv.slice(1);
+    for (let index = 0; index < 8; index += 1) {
+      upsertJob(workspace, { id: prefix + "-" + index, status: "running" });
+    }
+  `;
+  const { spawn } = await import("node:child_process");
+  const writers = Array.from({ length: 5 }, (_, index) =>
+    new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ["--input-type=module", "-e", writer, workspace, `job${index}`], { stdio: "inherit" });
+      child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`writer exited with ${code}`))));
+    })
+  );
+  await Promise.all(writers);
+
+  const state = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  assert.equal(state.jobs.length, 40);
+  assert.equal(fs.existsSync(path.join(resolveStateDir(workspace), "state.lock")), false);
+});

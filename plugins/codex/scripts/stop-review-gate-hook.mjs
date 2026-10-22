@@ -8,11 +8,12 @@ import { fileURLToPath } from "node:url";
 
 import { AUTO_REVIEW_OPTION_ENV } from "./lib/auto-review.mjs";
 import { getCodexAvailability } from "./lib/codex.mjs";
+import { applyPluginOptionSettingsFallback } from "./lib/plugin-options.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { getConfig, listJobs } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
-import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
+import { resolveConfiguredWorkspaceRoot, resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
@@ -144,7 +145,8 @@ function runStopReview(cwd, input = {}) {
 
 function main() {
   const input = readHookInput();
-  const cwd = input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  applyPluginOptionSettingsFallback();
+  const cwd = resolveConfiguredWorkspaceRoot() ?? (input.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd());
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const config = getConfig(workspaceRoot);
 

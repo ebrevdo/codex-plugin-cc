@@ -1,7 +1,7 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { getConfig, listJobs, listWorkspaceStates, readJobFile, resolveJobFile, resolveStateDir } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
@@ -188,25 +188,70 @@ export function readStoredJob(workspaceRoot, jobId) {
   return readJobFile(jobFile);
 }
 
+// Returns the job whose id is `reference`, else the only job whose id starts with it, else null.
+function findJobReference(jobs, reference) {
+  const exact = jobs.find((job) => job.id === reference);
+  if (exact) {
+    return exact;
+  }
+
+  const prefixMatches = jobs.filter((job) => job.id.startsWith(reference));
+  if (prefixMatches.length > 1) {
+    throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
+  }
+  return prefixMatches[0] ?? null;
+}
+
 function matchJobReference(jobs, reference, predicate = () => true) {
   const filtered = jobs.filter(predicate);
   if (!reference) {
     return filtered[0] ?? null;
   }
 
-  const exact = filtered.find((job) => job.id === reference);
-  if (exact) {
-    return exact;
+  const match = findJobReference(filtered, reference);
+  if (match) {
+    return match;
   }
 
-  const prefixMatches = filtered.filter((job) => job.id.startsWith(reference));
-  if (prefixMatches.length === 1) {
-    return prefixMatches[0];
-  }
-  if (prefixMatches.length > 1) {
-    throw new Error(`Job reference "${reference}" is ambiguous. Use a longer job id.`);
-  }
+  throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
+}
 
+function isActiveStatus(status) {
+  return status === "queued" || status === "running";
+}
+
+// Workspaces other than `workspaceRoot` that have plugin state, each with its jobs newest first.
+function listOtherWorkspaceJobs(workspaceRoot) {
+  const stateDir = resolveStateDir(workspaceRoot);
+  return listWorkspaceStates()
+    .filter((workspace) => workspace.stateDir !== stateDir)
+    .map((workspace) => ({ workspaceRoot: workspace.workspaceRoot, jobs: sortJobsNewestFirst(workspace.jobs) }));
+}
+
+// Looks a full job id up in every other workspace with plugin state. Job ids are unique, so a job started
+// with --cwd in another repository can still be inspected, steered, cancelled, or resumed by id from here.
+// Prefixes only match jobs in the current workspace, so a short reference never reaches another repository.
+function findJobInOtherWorkspaces(workspaceRoot, reference, predicate = () => true) {
+  for (const workspace of listOtherWorkspaceJobs(workspaceRoot)) {
+    const job = workspace.jobs.find((candidate) => candidate.id === reference && predicate(candidate));
+    if (job) {
+      return { workspaceRoot: workspace.workspaceRoot, job };
+    }
+  }
+  return null;
+}
+
+// Resolves a job reference in this workspace first and then in any other workspace.
+export function resolveJobReference(cwd, reference, predicate = () => true) {
+  const workspaceRoot = resolveWorkspaceRoot(cwd);
+  const local = findJobReference(sortJobsNewestFirst(listJobs(workspaceRoot)).filter(predicate), reference);
+  if (local) {
+    return { workspaceRoot, job: local };
+  }
+  const elsewhere = findJobInOtherWorkspaces(workspaceRoot, reference, predicate);
+  if (elsewhere) {
+    return elsewhere;
+  }
   throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
 }
 
@@ -216,10 +261,16 @@ export function buildStatusSnapshot(cwd, options = {}) {
   const jobs = sortJobsNewestFirst(filterJobsForCurrentSession(listJobs(workspaceRoot), options));
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
+  // This session's jobs that run in another workspace (for example a task started with --cwd elsewhere).
+  const elsewhere = getCurrentSessionId(options)
+    ? listOtherWorkspaceJobs(workspaceRoot).flatMap((workspace) =>
+        filterJobsForCurrentSession(workspace.jobs, options).filter((job) => isActiveStatus(job.status))
+      )
+    : [];
 
-  const running = jobs
-    .filter((job) => job.status === "queued" || job.status === "running")
-    .map((job) => enrichJob(job, { maxProgressLines }));
+  const running = [...jobs.filter((job) => isActiveStatus(job.status)), ...elsewhere].map((job) =>
+    enrichJob(job, { maxProgressLines })
+  );
 
   const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
   const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
@@ -240,38 +291,38 @@ export function buildStatusSnapshot(cwd, options = {}) {
 }
 
 export function buildSingleJobSnapshot(cwd, reference, options = {}) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot));
-  const selected = matchJobReference(jobs, reference);
-  if (!selected) {
-    throw new Error(`No job found for "${reference}". Run /codex:status to inspect known jobs.`);
-  }
-
+  const { workspaceRoot, job } = resolveJobReference(cwd, reference);
   return {
     workspaceRoot,
-    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
+    job: enrichJob(job, { maxProgressLines: options.maxProgressLines })
   };
 }
 
 export function resolveResultJob(cwd, reference) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const jobs = sortJobsNewestFirst(reference ? listJobs(workspaceRoot) : filterJobsForCurrentSession(listJobs(workspaceRoot)));
-  const selected = matchJobReference(
-    jobs,
-    reference,
-    (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled"
-  );
+  const isFinished = (job) => job.status === "completed" || job.status === "failed" || job.status === "cancelled";
+  const selected = reference ? findJobReference(jobs.filter(isFinished), reference) : matchJobReference(jobs, reference, isFinished);
 
   if (selected) {
     return { workspaceRoot, job: selected };
   }
 
-  const active = matchJobReference(jobs, reference, (job) => job.status === "queued" || job.status === "running");
+  const active = reference
+    ? findJobReference(jobs.filter((job) => isActiveStatus(job.status)), reference)
+    : matchJobReference(jobs, reference, (job) => isActiveStatus(job.status));
   if (active) {
     throw new Error(`Job ${active.id} is still ${active.status}. Check /codex:status and try again once it finishes.`);
   }
 
   if (reference) {
+    const elsewhere = findJobInOtherWorkspaces(workspaceRoot, reference);
+    if (elsewhere && isFinished(elsewhere.job)) {
+      return elsewhere;
+    }
+    if (elsewhere) {
+      throw new Error(`Job ${elsewhere.job.id} is still ${elsewhere.job.status}. Check /codex:status and try again once it finishes.`);
+    }
     throw new Error(`No finished job found for "${reference}". Run /codex:status to inspect active jobs.`);
   }
 
@@ -284,10 +335,8 @@ function listActiveJobs(workspaceRoot) {
 
 // Like resolveActiveJob with a reference, but returns null instead of throwing when nothing matches.
 export function findActiveJob(cwd, reference) {
-  const workspaceRoot = resolveWorkspaceRoot(cwd);
   try {
-    const job = matchJobReference(listActiveJobs(workspaceRoot), reference);
-    return job ? { workspaceRoot, job } : null;
+    return resolveJobReference(cwd, reference, (job) => isActiveStatus(job.status));
   } catch {
     return null;
   }
@@ -299,11 +348,15 @@ export function resolveActiveJob(cwd, reference, options = {}) {
   const activeJobs = listActiveJobs(workspaceRoot);
 
   if (reference) {
-    const selected = matchJobReference(activeJobs, reference);
-    if (!selected) {
-      throw new Error(`No active job found for "${reference}".`);
+    const selected = findJobReference(activeJobs, reference);
+    if (selected) {
+      return { workspaceRoot, job: selected };
     }
-    return { workspaceRoot, job: selected };
+    const elsewhere = findJobInOtherWorkspaces(workspaceRoot, reference, (job) => isActiveStatus(job.status));
+    if (elsewhere) {
+      return elsewhere;
+    }
+    throw new Error(`No job found for "${reference}". Run /codex:status to list known jobs.`);
   }
 
   const sessionScopedActiveJobs = filterJobsForCurrentSession(activeJobs, options);
