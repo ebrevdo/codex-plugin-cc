@@ -11,6 +11,7 @@ import {
     buildPersistentTaskThreadName,
     DEFAULT_CONTINUE_PROMPT,
     findLatestTaskThread,
+    forkAppServerThread,
     getCodexAuthStatus,
     getCodexAvailability,
     getSessionRuntimeStatus,
@@ -91,6 +92,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--resume-job <job-id>|--resume-thread <thread-id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
+      "  node scripts/codex-companion.mjs fork [session-id] [--job <job-id>] [--model <model|spark>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
@@ -706,6 +708,17 @@ function renderTransferResult(payload) {
   return `${lines.join("\n")}\n`;
 }
 
+function renderForkResult(payload) {
+  const lines = [
+    `Forked Codex session ${payload.sourceThreadId}.`,
+    `Job: ${payload.jobId}`,
+    `Codex session ID: ${payload.threadId}`,
+    `Resume in Codex: ${payload.resumeCommand}`,
+    `Continue with /codex:rescue --resume-job ${payload.jobId}`
+  ];
+  return `${lines.join("\n")}\n`;
+}
+
 async function executeTransfer(cwd, options = {}) {
   const sourcePath = resolveClaudeSessionPath(cwd, {
     source: options.source
@@ -927,6 +940,84 @@ async function handleTransfer(argv) {
     source: options.source
   });
   outputCommandResult(payload, rendered, options.json);
+}
+
+async function handleFork(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "job", "model"],
+    booleanOptions: ["json"],
+    aliasMap: { m: "model" }
+  });
+  if (positionals.length > 1 || (positionals.length && options.job)) {
+    throw new Error("Choose a Codex session ID or --job <job-id>, or omit both to fork the latest task thread.");
+  }
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const configuredRoot = resolveConfiguredWorkspaceRoot();
+  let sourceThreadId = positionals[0] ?? null;
+  let sourceWorkspaceRoot = workspaceRoot;
+
+  if (options.job) {
+    const source = resolveJobReference(workspaceRoot, options.job, (job) => job.jobClass === "task");
+    if (!source.job.threadId) {
+      throw new Error(`Job ${source.job.id} never started a Codex thread, so there is nothing to fork.`);
+    }
+    sourceThreadId = source.job.threadId;
+    sourceWorkspaceRoot = source.workspaceRoot;
+  } else if (!sourceThreadId) {
+    const fallbackWorkspaceRoot = resolveWorkspaceRoot(options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd());
+    for (const root of new Set([workspaceRoot, fallbackWorkspaceRoot])) {
+      const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(root)));
+      const source = jobs.find((job) => job.jobClass === "task" && job.threadId);
+      if (source) {
+        sourceThreadId = source.threadId;
+        break;
+      }
+    }
+    if (!sourceThreadId && !getCurrentClaudeSessionId()) {
+      sourceThreadId = (await findLatestTaskThread(cwd))?.id ?? null;
+    }
+    if (!sourceThreadId) {
+      throw new Error("No previous Codex task thread was found for this repository. Pass a Codex session ID or --job <job-id>.");
+    }
+  }
+
+  const forkCwd = configuredRoot ?? (options.job ? sourceWorkspaceRoot : cwd);
+  ensureCodexAvailable(forkCwd);
+  const job = createCompanionJob({
+    prefix: "task",
+    kind: "fork",
+    title: "Codex Fork",
+    workspaceRoot: resolveWorkspaceRoot(forkCwd),
+    jobClass: "task",
+    summary: `Fork of ${sourceThreadId}`
+  });
+  await runForegroundCommand(
+    job,
+    async (progress) => {
+      const result = await forkAppServerThread(forkCwd, {
+        threadId: sourceThreadId,
+        model: normalizeRequestedModel(options.model),
+        ...resolveTaskApprovals(),
+        onProgress: progress
+      });
+      const payload = {
+        jobId: job.id,
+        sourceThreadId,
+        threadId: result.threadId,
+        resumeCommand: `codex resume ${result.threadId}`
+      };
+      return {
+        exitStatus: 0,
+        threadId: result.threadId,
+        payload,
+        rendered: renderForkResult(payload),
+        summary: `Fork of ${sourceThreadId}`
+      };
+    },
+    { json: options.json }
+  );
 }
 
 async function handleTaskWorker(argv) {
@@ -1209,6 +1300,9 @@ async function main() {
       break;
     case "transfer":
       await handleTransfer(argv);
+      break;
+    case "fork":
+      await handleFork(argv);
       break;
     case "task-worker":
       await handleTaskWorker(argv);

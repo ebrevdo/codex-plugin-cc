@@ -1168,6 +1168,31 @@ export async function importExternalAgentSession(cwd, options = {}) {
   });
 }
 
+export async function forkAppServerThread(cwd, options = {}) {
+  // Close the runtime after copying the history so the fork can be opened immediately elsewhere.
+  return withDirectAppServer(cwd, async (client) => {
+    emitProgress(options.onProgress, `Forking thread ${options.threadId}.`, "starting");
+    let response;
+    try {
+      response = await client.request("thread/fork", {
+        ...buildResumeParams(options.threadId, cwd, options),
+        ephemeral: false
+      });
+    } catch (error) {
+      if (error?.rpcCode === -32601) {
+        throw new Error(
+          "This Codex version does not support session forking. Update Codex with `npm install -g @openai/codex@latest`, then retry.",
+          { cause: error }
+        );
+      }
+      throw error;
+    }
+    const threadId = response.thread.id;
+    emitProgress(options.onProgress, `Fork ready (${threadId}).`, "completed", { threadId });
+    return { threadId, stderr: cleanCodexStderr(client.stderr) };
+  });
+}
+
 export async function runAppServerTurn(cwd, options = {}) {
   const availability = getCodexAvailability(cwd);
   if (!availability.available) {

@@ -11,7 +11,7 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:transfer`, `/codex:status`, `/codex:result`, `/codex:steer`, and `/codex:cancel` to delegate work, hand off sessions, and manage background jobs
+- `/codex:rescue`, `/codex:fork`, `/codex:transfer`, `/codex:status`, `/codex:result`, `/codex:steer`, and `/codex:cancel` to delegate work, fork or hand off sessions, and manage background jobs
 
 ## Requirements
 
@@ -164,6 +164,32 @@ Ask Codex to redesign the database connection to be more resilient.
 - follow-up rescue requests can continue the latest Codex task in the repo
 - every rescue task runs on a Codex app server of its own, so several tasks can run at once in one repo and each can be steered, cancelled, and resumed on its own
 - Codex lets one app server at a time open a thread. If the repo's shared runtime still holds the thread you resume (from a task run by an older plugin version), the plugin stops that runtime when it is idle; a thread open in the Codex app or a `codex resume` session must be closed there first
+
+### `/codex:fork`
+
+Copies a Codex session's history into a new persistent thread. Further work in the fork leaves the source
+session unchanged. Forking does not start a Codex turn.
+
+With no arguments, it forks the latest task thread from this Claude session and repository. Pass a Codex
+session ID or `--job <job-id>` to choose another source, including a session that is still open.
+
+Examples:
+
+```bash
+/codex:fork
+/codex:fork <session-id>
+/codex:fork --job task-abc123
+/codex:fork --job task-abc123 --model spark
+/codex:rescue --resume-job <fork-job-id> try a different approach
+```
+
+The command prints the new session ID, fork job ID, and a `codex resume <session-id>` command. Continue the
+copy with `/codex:rescue --resume-job <fork-job-id>` to target it from any repository. The fork also appears
+in `/codex:status` and `/codex:result`.
+
+Forks use the same `codex_home`, `workspace_root`, `fast_mode`, and `auto_review` plugin settings as rescue
+tasks. Forking by job ID uses the source job's repository unless `workspace_root` overrides it. `--model`
+accepts the same model names and `spark` alias as rescue.
 
 ### `/codex:transfer`
 

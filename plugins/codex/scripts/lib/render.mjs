@@ -420,7 +420,7 @@ export function renderStoredJobResult(job, storedJob) {
 
   if (storedJob?.rendered) {
     const output = storedJob.rendered.endsWith("\n") ? storedJob.rendered : `${storedJob.rendered}\n`;
-    if (!threadId) {
+    if (!threadId || (output.includes(`Codex session ID: ${threadId}`) && output.includes(`Resume in Codex: ${resumeCommand}`))) {
       return output;
     }
     return `${output}\nCodex session ID: ${threadId}\nResume in Codex: ${resumeCommand}\n`;

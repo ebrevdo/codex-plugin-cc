@@ -12,6 +12,8 @@ import type {
   ReviewStartResponse,
   ReviewTarget,
   Thread,
+  ThreadForkParams,
+  ThreadForkResponse,
   ThreadItem,
   ThreadListParams,
   ThreadListResponse,
@@ -64,6 +66,7 @@ export interface AppServerMethodMap {
   "externalAgentConfig/import": { params: ExternalAgentConfigImportParams; result: ExternalAgentConfigImportResponse };
   "thread/start": { params: ThreadStartParams; result: ThreadStartResponse };
   "thread/resume": { params: ThreadResumeParams; result: ThreadResumeResponse };
+  "thread/fork": { params: ThreadForkParams; result: ThreadForkResponse };
   "thread/name/set": { params: ThreadSetNameParams; result: ThreadSetNameResponse };
   "thread/list": { params: ThreadListParams; result: ThreadListResponse };
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };

@@ -75,6 +75,7 @@ test("continue is not exposed as a user-facing command", () => {
   assert.deepEqual(commandFiles, [
     "adversarial-review.md",
     "cancel.md",
+    "fork.md",
     "rescue.md",
     "result.md",
     "review.md",
@@ -172,13 +173,17 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:steer`/);
 });
 
-test("transfer, result, steer, and cancel commands are exposed as deterministic runtime entrypoints", () => {
+test("fork, transfer, result, steer, and cancel commands are exposed as deterministic runtime entrypoints", () => {
+  const fork = read("commands/fork.md");
   const transfer = read("commands/transfer.md");
   const result = read("commands/result.md");
   const steer = read("commands/steer.md");
   const cancel = read("commands/cancel.md");
   const resultHandling = read("skills/codex-result-handling/SKILL.md");
 
+  assert.match(fork, /disable-model-invocation:\s*true/);
+  assert.match(fork, /codex-companion\.mjs" fork "\$ARGUMENTS"/);
+  assert.match(fork, /codex resume <session-id>/);
   assert.match(transfer, /disable-model-invocation:\s*true/);
   assert.match(transfer, /codex-companion\.mjs" transfer "\$ARGUMENTS"/);
   assert.match(transfer, /codex resume <session-id>/);

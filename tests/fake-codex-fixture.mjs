@@ -477,6 +477,27 @@ function handleMessage(message) {
         send({ id: message.id, result: { data: [...loadedThreads], nextCursor: null } });
         break;
 
+      case "thread/fork": {
+        if (BEHAVIOR === "fork-unsupported") {
+          send({ id: message.id, error: { code: -32601, message: "Unsupported method: thread/fork" } });
+          break;
+        }
+        const source = ensureThread(state, message.params.threadId);
+        const thread = nextThread(state, message.params.cwd ?? source.cwd, message.params.ephemeral);
+        thread.name = source.name;
+        thread.preview = source.preview;
+        thread.visibleMessages = structuredClone(source.visibleMessages || []);
+        loadThread(thread.id);
+        state.lastThreadFork = {
+          ...message.params,
+          codexHome: process.env.CODEX_HOME || null
+        };
+        saveState(state);
+        send({ id: message.id, result: { thread: buildThread(thread) } });
+        send({ method: "thread/started", params: { thread: { id: thread.id } } });
+        break;
+      }
+
       case "thread/unsubscribe":
         send({ id: message.id, result: { status: loadedThreads.has(message.params.threadId) ? "unsubscribed" : "notLoaded" } });
         break;
