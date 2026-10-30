@@ -20,6 +20,7 @@ import {
     parseStructuredOutput,
     readOutputSchema,
     runAppServerReview,
+    runAppServerSideTurn,
     runAppServerTurn,
     steerAppServerTurn
   } from "./lib/codex.mjs";
@@ -93,6 +94,7 @@ function printUsage() {
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--resume-job <job-id>|--resume-thread <thread-id>|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs fork [session-id] [--job <job-id>] [--model <model|spark>] [--json]",
+      "  node scripts/codex-companion.mjs side [job-id|session-id] [--job <job-id>] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh|max|ultra>] [--prompt-file <path>] [--json] [question]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]",
@@ -645,6 +647,9 @@ function getJobKindLabel(kind, jobClass) {
   if (kind === "adversarial-review") {
     return "adversarial-review";
   }
+  if (jobClass === "side") {
+    return "side";
+  }
   return jobClass === "review" ? "review" : "rescue";
 }
 
@@ -942,6 +947,35 @@ async function handleTransfer(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
+// The thread a fork or side question starts from: a Codex session ID, a task job's thread, or the latest task
+// thread from this Claude session.
+async function resolveSourceThread(workspaceRoot, cwd, { sessionId = null, jobId = null, cwdOption = null, action = "fork" } = {}) {
+  if (jobId) {
+    const source = resolveJobReference(workspaceRoot, jobId, (job) => job.jobClass === "task");
+    if (!source.job.threadId) {
+      throw new Error(`Job ${source.job.id} never started a Codex thread, so there is nothing to ${action}.`);
+    }
+    return { threadId: source.job.threadId, workspaceRoot: source.workspaceRoot };
+  }
+  if (sessionId) {
+    return { threadId: sessionId, workspaceRoot };
+  }
+
+  const fallbackWorkspaceRoot = resolveWorkspaceRoot(cwdOption ? path.resolve(process.cwd(), cwdOption) : process.cwd());
+  for (const root of new Set([workspaceRoot, fallbackWorkspaceRoot])) {
+    const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(root)));
+    const source = jobs.find((job) => job.jobClass === "task" && job.threadId);
+    if (source) {
+      return { threadId: source.threadId, workspaceRoot };
+    }
+  }
+  const latestThreadId = getCurrentClaudeSessionId() ? null : (await findLatestTaskThread(cwd))?.id ?? null;
+  if (latestThreadId) {
+    return { threadId: latestThreadId, workspaceRoot };
+  }
+  throw new Error("No previous Codex task thread was found for this repository. Pass a Codex session ID or --job <job-id>.");
+}
+
 async function handleFork(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job", "model"],
@@ -955,35 +989,14 @@ async function handleFork(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const configuredRoot = resolveConfiguredWorkspaceRoot();
-  let sourceThreadId = positionals[0] ?? null;
-  let sourceWorkspaceRoot = workspaceRoot;
+  const source = await resolveSourceThread(workspaceRoot, cwd, {
+    sessionId: positionals[0] ?? null,
+    jobId: options.job ?? null,
+    cwdOption: options.cwd ?? null
+  });
+  const sourceThreadId = source.threadId;
 
-  if (options.job) {
-    const source = resolveJobReference(workspaceRoot, options.job, (job) => job.jobClass === "task");
-    if (!source.job.threadId) {
-      throw new Error(`Job ${source.job.id} never started a Codex thread, so there is nothing to fork.`);
-    }
-    sourceThreadId = source.job.threadId;
-    sourceWorkspaceRoot = source.workspaceRoot;
-  } else if (!sourceThreadId) {
-    const fallbackWorkspaceRoot = resolveWorkspaceRoot(options.cwd ? path.resolve(process.cwd(), options.cwd) : process.cwd());
-    for (const root of new Set([workspaceRoot, fallbackWorkspaceRoot])) {
-      const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(root)));
-      const source = jobs.find((job) => job.jobClass === "task" && job.threadId);
-      if (source) {
-        sourceThreadId = source.threadId;
-        break;
-      }
-    }
-    if (!sourceThreadId && !getCurrentClaudeSessionId()) {
-      sourceThreadId = (await findLatestTaskThread(cwd))?.id ?? null;
-    }
-    if (!sourceThreadId) {
-      throw new Error("No previous Codex task thread was found for this repository. Pass a Codex session ID or --job <job-id>.");
-    }
-  }
-
-  const forkCwd = configuredRoot ?? (options.job ? sourceWorkspaceRoot : cwd);
+  const forkCwd = configuredRoot ?? (options.job ? source.workspaceRoot : cwd);
   ensureCodexAvailable(forkCwd);
   const job = createCompanionJob({
     prefix: "task",
@@ -1016,6 +1029,109 @@ async function handleFork(argv) {
         summary: `Fork of ${sourceThreadId}`
       };
     },
+    { json: options.json }
+  );
+}
+
+const SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// A leading token names the source only when it is a job of this repository or a Codex session ID, so a question can
+// start with any word.
+function findSideSource(workspaceRoot, token) {
+  if (!token) {
+    return null;
+  }
+  const jobs = listJobs(workspaceRoot);
+  if (jobs.some((job) => job.id === token)) {
+    return { jobId: token };
+  }
+  if (SESSION_ID_PATTERN.test(token) || jobs.some((job) => job.threadId === token)) {
+    return { sessionId: token };
+  }
+  return null;
+}
+
+async function executeSideRun(request) {
+  const result = await runAppServerSideTurn(request.cwd, {
+    threadId: request.threadId,
+    prompt: request.prompt,
+    model: request.model,
+    effort: request.effort,
+    onProgress: request.onProgress
+  });
+
+  const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
+  const failureMessage = result.error?.message ?? result.stderr ?? "";
+  const payload = {
+    status: result.status,
+    sourceThreadId: result.sourceThreadId,
+    rawOutput,
+    reasoningSummary: result.reasoningSummary
+  };
+
+  // No threadId: the side conversation is ephemeral and must not become a resume, fork, or steer target.
+  return {
+    exitStatus: result.status,
+    payload,
+    rendered: renderTaskResult(
+      { rawOutput, failureMessage, reasoningSummary: result.reasoningSummary },
+      { title: "Codex Side", jobId: request.jobId ?? null, write: false }
+    ),
+    summary: firstMeaningfulLine(rawOutput, firstMeaningfulLine(failureMessage, "Codex Side finished."))
+  };
+}
+
+async function handleSide(argv) {
+  const { options, positionals } = parseCommandInput(argv, {
+    valueOptions: ["cwd", "job", "model", "effort", "prompt-file"],
+    booleanOptions: ["json", "wait", "background"],
+    aliasMap: { m: "model" }
+  });
+
+  const cwd = resolveCommandCwd(options);
+  const workspaceRoot = resolveCommandWorkspace(options);
+  const [first, ...rest] = positionals;
+  const named = findSideSource(workspaceRoot, first);
+  if (named && options.job) {
+    throw new Error("Choose a Codex session ID or --job <job-id>, not both.");
+  }
+  const prompt = (readTaskPrompt(cwd, options, named ? rest : positionals) ?? "").trim();
+  if (!prompt) {
+    throw new Error("Provide a side question, a prompt file, or piped stdin.");
+  }
+  const model = normalizeRequestedModel(options.model);
+  const effort = normalizeReasoningEffort(options.effort);
+
+  const jobId = named?.jobId ?? options.job ?? null;
+  const source = await resolveSourceThread(workspaceRoot, cwd, {
+    sessionId: named?.sessionId ?? null,
+    jobId,
+    cwdOption: options.cwd ?? null,
+    action: "ask"
+  });
+  const sideCwd = resolveConfiguredWorkspaceRoot() ?? (jobId ? source.workspaceRoot : cwd);
+  ensureCodexAvailable(sideCwd);
+
+  const job = createCompanionJob({
+    prefix: "side",
+    kind: "side",
+    title: "Codex Side",
+    workspaceRoot: resolveWorkspaceRoot(sideCwd),
+    jobClass: "side",
+    summary: `Side question for ${source.threadId}: ${shorten(prompt)}`
+  });
+  await runForegroundCommand(
+    job,
+    (progress) =>
+      executeSideRun({
+        cwd: sideCwd,
+        threadId: source.threadId,
+        prompt,
+        model,
+        effort,
+        jobId: job.id,
+        onProgress: progress
+      }),
     { json: options.json }
   );
 }
@@ -1303,6 +1419,9 @@ async function main() {
       break;
     case "fork":
       await handleFork(argv);
+      break;
+    case "side":
+      await handleSide(argv);
       break;
     case "task-worker":
       await handleTaskWorker(argv);

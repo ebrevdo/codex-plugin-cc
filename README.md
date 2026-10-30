@@ -11,7 +11,7 @@ they already have.
 
 - `/codex:review` for a normal read-only Codex review
 - `/codex:adversarial-review` for a steerable challenge review
-- `/codex:rescue`, `/codex:fork`, `/codex:transfer`, `/codex:status`, `/codex:result`, `/codex:steer`, and `/codex:cancel` to delegate work, fork or hand off sessions, and manage background jobs
+- `/codex:rescue`, `/codex:fork`, `/codex:side`, `/codex:transfer`, `/codex:status`, `/codex:result`, `/codex:steer`, and `/codex:cancel` to delegate work, fork, question, or hand off sessions, and manage background jobs
 
 ## Requirements
 
@@ -190,6 +190,33 @@ in `/codex:status` and `/codex:result`.
 Forks use the same `codex_home`, `workspace_root`, `fast_mode`, and `auto_review` plugin settings as rescue
 tasks. Forking by job ID uses the source job's repository unless `workspace_root` overrides it. `--model`
 accepts the same model names and `spark` alias as rescue.
+
+### `/codex:side`
+
+Asks a Codex session a side question without disturbing it, like `/side` in the Codex TUI. The question runs in
+an ephemeral, read-only fork that sees the session's history as reference only, so you can ask what a long
+task is doing or why while it keeps running. Nothing from the side conversation is added to the source
+session or saved.
+
+With no source, it asks the latest task thread from this Claude session and repository. A leading job ID or
+Codex session ID, or `--job <job-id>`, chooses another source, including a task that is still running.
+
+Examples:
+
+```bash
+/codex:side what are you trying right now, and why?
+/codex:side task-abc123 which approach looks most promising so far?
+/codex:side <session-id> summarize the open questions
+/codex:side --job task-abc123 --effort high --background list the files you changed and why
+```
+
+The answer prints when the side turn finishes. Add `--background` to run the question as a Claude background
+task and read the answer later with `/codex:result`. The side job appears in `/codex:status`, but it cannot be
+resumed, forked, or steered: the side conversation ends with its answer.
+
+Side questions use the same `codex_home`, `workspace_root`, and `fast_mode` plugin settings as rescue tasks and
+always run read-only without approval prompts. `--model` and `--effort` accept the same values as rescue; without
+them, Codex chooses its defaults.
 
 ### `/codex:transfer`
 

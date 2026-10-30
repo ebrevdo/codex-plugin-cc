@@ -80,6 +80,7 @@ test("continue is not exposed as a user-facing command", () => {
     "result.md",
     "review.md",
     "setup.md",
+    "side.md",
     "status.md",
     "steer.md",
     "transfer.md"
@@ -171,10 +172,12 @@ test("rescue command absorbs continue semantics", () => {
   assert.match(readme, /### `\/codex:result`/);
   assert.match(readme, /### `\/codex:cancel`/);
   assert.match(readme, /### `\/codex:steer`/);
+  assert.match(readme, /### `\/codex:side`/);
 });
 
 test("fork, transfer, result, steer, and cancel commands are exposed as deterministic runtime entrypoints", () => {
   const fork = read("commands/fork.md");
+  const side = read("commands/side.md");
   const transfer = read("commands/transfer.md");
   const result = read("commands/result.md");
   const steer = read("commands/steer.md");
@@ -184,6 +187,10 @@ test("fork, transfer, result, steer, and cancel commands are exposed as determin
   assert.match(fork, /disable-model-invocation:\s*true/);
   assert.match(fork, /codex-companion\.mjs" fork "\$ARGUMENTS"/);
   assert.match(fork, /codex resume <session-id>/);
+  assert.match(side, /disable-model-invocation:\s*true/);
+  assert.match(side, /codex-companion\.mjs" side "\$ARGUMENTS"/);
+  assert.match(side, /run_in_background: true/);
+  assert.match(side, /Return the command stdout verbatim/);
   assert.match(transfer, /disable-model-invocation:\s*true/);
   assert.match(transfer, /codex-companion\.mjs" transfer "\$ARGUMENTS"/);
   assert.match(transfer, /codex resume <session-id>/);

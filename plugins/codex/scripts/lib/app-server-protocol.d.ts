@@ -14,6 +14,8 @@ import type {
   Thread,
   ThreadForkParams,
   ThreadForkResponse,
+  ThreadInjectItemsParams,
+  ThreadInjectItemsResponse,
   ThreadItem,
   ThreadListParams,
   ThreadListResponse,
@@ -67,6 +69,7 @@ export interface AppServerMethodMap {
   "thread/start": { params: ThreadStartParams; result: ThreadStartResponse };
   "thread/resume": { params: ThreadResumeParams; result: ThreadResumeResponse };
   "thread/fork": { params: ThreadForkParams; result: ThreadForkResponse };
+  "thread/inject_items": { params: ThreadInjectItemsParams; result: ThreadInjectItemsResponse };
   "thread/name/set": { params: ThreadSetNameParams; result: ThreadSetNameResponse };
   "thread/list": { params: ThreadListParams; result: ThreadListResponse };
   "review/start": { params: ReviewStartParams; result: ReviewStartResponse };

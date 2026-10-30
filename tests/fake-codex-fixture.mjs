@@ -498,6 +498,15 @@ function handleMessage(message) {
         break;
       }
 
+      case "thread/inject_items": {
+        const thread = ensureThread(state, message.params.threadId);
+        thread.injectedItems = [...(thread.injectedItems || []), ...structuredClone(message.params.items || [])];
+        state.lastInjectItems = { threadId: thread.id, items: message.params.items };
+        saveState(state);
+        send({ id: message.id, result: {} });
+        break;
+      }
+
       case "thread/unsubscribe":
         send({ id: message.id, result: { status: loadedThreads.has(message.params.threadId) ? "unsubscribed" : "notLoaded" } });
         break;
